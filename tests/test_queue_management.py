@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 from psycopg import sql
+from psycopg.types.json import Jsonb
 import pytest
 
 
@@ -58,6 +59,66 @@ def test_cleanup_tasks_and_events(client):
     # Sanity check
     assert client.count_tasks(queue) == 0
     assert client.count_events(queue) == 0
+
+
+def test_cleanup_events_rejects_invalid_limit(client):
+    queue = "cleanup-invalid-event-limit"
+    client.create_queue(queue)
+    client.emit_event(queue, "event", {"value": 1})
+
+    for invalid_limit in (None, 0, -1):
+        savepoint = f"cleanup_events_limit_{str(invalid_limit).replace('-', 'n')}"
+        client.conn.execute(f"savepoint {savepoint}")
+        with pytest.raises(Exception, match="cleanup limit must be at least 1"):
+            client.cleanup_events(queue, ttl_seconds=0, limit=invalid_limit)
+        client.conn.execute(f"rollback to savepoint {savepoint}")
+        client.conn.execute(f"release savepoint {savepoint}")
+
+    assert client.count_events(queue) == 1
+
+
+def test_cleanup_events_skips_event_locked_by_emission(db_dsn):
+    queue = "cleanup-event-race"
+    event_name = "event"
+    event_table = sql.Identifier(f"e_{queue}")
+
+    try:
+        with psycopg.connect(db_dsn, autocommit=True) as setup:
+            setup.execute("select absurd.create_queue(%s)", (queue,))
+            setup.execute(
+                sql.SQL(
+                    "insert into absurd.{event} (event_name, payload, emitted_at) "
+                    "values (%s, null, clock_timestamp() - interval '1 hour')"
+                ).format(event=event_table),
+                (event_name,),
+            )
+
+        with psycopg.connect(db_dsn) as emitting:
+            emitting.execute(
+                "select absurd.emit_event(%s, %s, %s)",
+                (queue, event_name, Jsonb({"fresh": True})),
+            )
+
+            with psycopg.connect(db_dsn, autocommit=True) as cleaner:
+                cleaner.execute("set lock_timeout = '500ms'")
+                deleted = cleaner.execute(
+                    "select absurd.cleanup_events(%s, 0, 1)", (queue,)
+                ).fetchone()[0]
+                assert deleted == 0
+
+        with psycopg.connect(db_dsn, autocommit=True) as check:
+            event = check.execute(
+                sql.SQL(
+                    "select payload, emitted_at from absurd.{event} where event_name = %s"
+                ).format(event=event_table),
+                (event_name,),
+            ).fetchone()
+            assert event is not None
+            assert event[0] == {"fresh": True}
+            assert isinstance(event[1], datetime)
+    finally:
+        with psycopg.connect(db_dsn, autocommit=True) as cleanup:
+            cleanup.execute("select absurd.drop_queue(%s)", (queue,))
 
 
 def test_cleanup_tasks_rejects_invalid_limit(client):
@@ -509,12 +570,12 @@ def test_create_queue_rejects_unknown_storage_mode(client):
 
 
 def test_queue_name_validation_limits(client):
-    max_len_queue = "q" * 57
+    max_len_queue = "q" * 53
     client.create_queue(max_len_queue)
     assert max_len_queue in client.list_queues()
 
     with pytest.raises(Exception):
-        client.create_queue("q" * 58)
+        client.create_queue("q" * 54)
 
 
 def test_queue_name_validation_allows_permissive_postgres_names(client):

@@ -161,8 +161,8 @@ as $$
 $$;
 
 -- Queue names are used in generated table/index identifiers.
--- We intentionally cap UTF-8 byte length so generated explicit index names
--- (for instance r_<queue>_sai) stay within PostgreSQL's 63-byte identifier
+-- We intentionally cap UTF-8 byte length so generated weekly partition names
+-- (<prefix>_<queue>_<ISO year/week>) stay within PostgreSQL's 63-byte identifier
 -- limit. Character set is otherwise delegated to PostgreSQL quoted-ident rules.
 create function absurd.validate_queue_name (p_queue_name text)
   returns text
@@ -173,8 +173,8 @@ begin
     raise exception 'Queue name must be provided';
   end if;
 
-  if octet_length(p_queue_name) > 57 then
-    raise exception 'Queue name "%" is too long (max 57 bytes).', p_queue_name;
+  if octet_length(p_queue_name) > 53 then
+    raise exception 'Queue name "%" is too long (max 53 bytes).', p_queue_name;
   end if;
 
   return p_queue_name;
@@ -1470,6 +1470,7 @@ create function absurd.set_task_checkpoint_state (
 as $$
 declare
   v_now timestamptz := absurd.current_time();
+  v_run_task_id uuid;
   v_new_attempt integer;
   v_existing_attempt integer;
   v_existing_owner uuid;
@@ -1481,18 +1482,23 @@ begin
   end if;
 
   execute format(
-    'select r.attempt, r.state, t.state
+    'select r.task_id, r.attempt, r.state, t.state
        from absurd.%I r
        join absurd.%I t on t.task_id = r.task_id
-      where r.run_id = $1',
+      where r.run_id = $1
+      for update of r',
     'r_' || p_queue_name,
     't_' || p_queue_name
   )
-  into v_new_attempt, v_run_state, v_task_state
+  into v_run_task_id, v_new_attempt, v_run_state, v_task_state
   using p_owner_run;
 
-  if v_new_attempt is null then
+  if v_run_task_id is null then
     raise exception 'Run "%" not found for checkpoint', p_owner_run;
+  end if;
+
+  if v_run_task_id <> p_task_id then
+    raise exception 'Run "%" does not belong to task "%" in queue "%"', p_owner_run, p_task_id, p_queue_name;
   end if;
 
   if v_task_state = 'cancelled' then
@@ -1501,6 +1507,13 @@ begin
 
   if v_run_state = 'failed' then
     raise exception sqlstate 'AB002' using message = format('Run "%s" has already failed in queue "%s"', p_owner_run, p_queue_name);
+  end if;
+
+  if v_task_state in ('completed', 'failed') or v_run_state in ('completed', 'cancelled') then
+    raise exception 'Cannot checkpoint terminal run "%" or task "%" in queue "%"',
+      p_owner_run,
+      p_task_id,
+      p_queue_name;
   end if;
 
   -- Extend the claim if requested
@@ -1704,6 +1717,7 @@ create function absurd.await_event (
   language plpgsql
 as $$
 declare
+  v_run_task_id uuid;
   v_run_state text;
   v_existing_payload jsonb;
   v_event_payload jsonb;
@@ -1727,6 +1741,23 @@ begin
   end if;
 
   v_available_at := coalesce(v_timeout_at, 'infinity'::timestamptz);
+
+  execute format(
+    'select task_id
+       from absurd.%I
+      where run_id = $1',
+    'r_' || p_queue_name
+  )
+  into v_run_task_id
+  using p_run_id;
+
+  if v_run_task_id is null then
+    raise exception 'Run "%" not found while awaiting event', p_run_id;
+  end if;
+
+  if v_run_task_id <> p_task_id then
+    raise exception 'Run "%" does not belong to task "%" in queue "%"', p_run_id, p_task_id, p_queue_name;
+  end if;
 
   execute format(
     'select state
@@ -1767,7 +1798,7 @@ begin
   ) using p_event_name;
 
   execute format(
-    'select r.state, r.event_payload, r.wake_event, t.state
+    'select r.task_id, r.state, r.event_payload, r.wake_event, t.state
        from absurd.%I r
        join absurd.%I t on t.task_id = r.task_id
       where r.run_id = $1
@@ -1775,11 +1806,15 @@ begin
     'r_' || p_queue_name,
     't_' || p_queue_name
   )
-  into v_run_state, v_existing_payload, v_wake_event, v_task_state
+  into v_run_task_id, v_run_state, v_existing_payload, v_wake_event, v_task_state
   using p_run_id;
 
   if v_run_state is null then
     raise exception 'Run "%" not found while awaiting event', p_run_id;
+  end if;
+
+  if v_run_task_id <> p_task_id then
+    raise exception 'Run "%" does not belong to task "%" in queue "%"', p_run_id, p_task_id, p_queue_name;
   end if;
 
   if v_task_state = 'cancelled' then
@@ -1812,6 +1847,18 @@ begin
     raise exception 'Run "%" must be running to await events', p_run_id;
   end if;
 
+  -- A timeout wake-up wins over an event emitted after the wait expired.
+  -- emit_event deliberately excludes expired waits, so consuming that later
+  -- global event here would disagree with the wake-up decision already made.
+  if v_wake_event = p_event_name and v_existing_payload is null then
+    execute format(
+      'update absurd.%I set wake_event = null where run_id = $1',
+      'r_' || p_queue_name
+    ) using p_run_id;
+    return query select false, null::jsonb;
+    return;
+  end if;
+
   if v_resolved_payload is null and v_event_payload is not null then
     v_resolved_payload := v_event_payload;
   end if;
@@ -1828,17 +1875,6 @@ begin
       'c_' || p_queue_name
     ) using p_task_id, p_step_name, v_resolved_payload, p_run_id, v_now;
     return query select false, v_resolved_payload;
-    return;
-  end if;
-
-  -- Detect if we resumed due to timeout: wake_event matches and payload is null
-  if v_resolved_payload is null and v_wake_event = p_event_name and v_existing_payload is null then
-    -- Resumed due to timeout; don't re-sleep and don't create a new wait
-    execute format(
-      'update absurd.%I set wake_event = null where run_id = $1',
-      'r_' || p_queue_name
-    ) using p_run_id;
-    return query select false, null::jsonb;
     return;
   end if;
 
@@ -2262,15 +2298,20 @@ begin
     raise exception 'TTL must be a non-negative number of seconds';
   end if;
 
+  if p_limit is null or p_limit < 1 then
+    raise exception 'cleanup limit must be at least 1';
+  end if;
+
   v_cutoff := v_now - (p_ttl_seconds * interval '1 second');
 
   execute format(
     'with to_delete as (
-        select event_name
-          from absurd.%I
-         where emitted_at < $1
-         order by emitted_at
+        select e.event_name
+          from absurd.%I e
+         where e.emitted_at < $1
+         order by e.emitted_at
          limit $2
+         for update of e skip locked
      ),
      del_events as (
         delete from absurd.%I e
