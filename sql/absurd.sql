@@ -2383,16 +2383,16 @@ as $$
   select date_trunc('week', p_ts at time zone 'UTC') at time zone 'UTC';
 $$;
 
--- Returns a compact weekly partition tag in YWW format, where:
--- * Y = last digit of the ISO year in UTC
+-- Returns a weekly partition tag in IYYYIW format, where:
+-- * IYYY = complete ISO year in UTC
 -- * WW = zero-padded ISO week number in UTC (01..53)
 --
 -- ISO weeks do not have week 0; days at year boundaries can belong
 -- to week 52/53 of the previous ISO year.
 --
 -- Examples:
--- * 2024-01-01 UTC -> 401
--- * 2021-01-01 UTC -> 053 (ISO week 53 of ISO year 2020)
+-- * 2024-01-01 UTC -> 202401
+-- * 2021-01-01 UTC -> 202053 (ISO week 53 of ISO year 2020)
 create function absurd.partition_week_tag (p_ts timestamptz)
   returns text
   language sql
@@ -2403,7 +2403,7 @@ as $$
     select absurd.week_bucket_utc(p_ts) at time zone 'UTC' as ts
   )
   select
-    ((extract(isoyear from ts)::int % 10)::text) ||
+    (extract(isoyear from ts)::int)::text ||
     lpad((extract(week from ts)::int)::text, 2, '0')
   from bucket;
 $$;
