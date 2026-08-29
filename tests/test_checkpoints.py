@@ -115,6 +115,61 @@ def test_checkpoint_write_on_failed_run_raises_ab002(client):
     client.conn.execute(f"release savepoint {savepoint}")
 
 
+def test_checkpoint_write_requires_run_task_match(client):
+    queue = "checkpoint-run-match"
+    client.create_queue(queue)
+
+    first = client.spawn_task(queue, "first", {"value": 1})
+    second = client.spawn_task(queue, "second", {"value": 2})
+    claims = client.claim_tasks(queue, worker="worker-1", claim_timeout=60, qty=2)
+    claims_by_task = {claim["task_id"]: claim for claim in claims}
+    first_run = claims_by_task[first.task_id]["run_id"]
+    second_run = claims_by_task[second.task_id]["run_id"]
+
+    client.set_task_checkpoint_state(
+        queue, second.task_id, "step", {"value": "original"}, second_run, 60
+    )
+    first_run_before = client.get_run(queue, first_run)
+
+    savepoint = "checkpoint_run_task_match"
+    client.conn.execute(f"savepoint {savepoint}")
+    with pytest.raises(Exception, match="does not belong"):
+        client.set_task_checkpoint_state(
+            queue, second.task_id, "step", {"value": "wrong"}, first_run, 600
+        )
+    client.conn.execute(f"rollback to savepoint {savepoint}")
+    client.conn.execute(f"release savepoint {savepoint}")
+
+    assert client.get_checkpoint(queue, second.task_id, "step")["state"] == {
+        "value": "original"
+    }
+    assert client.get_run(queue, first_run) == first_run_before
+
+
+def test_checkpoint_write_rejects_terminal_task(client):
+    queue = "checkpoint-terminal"
+    client.create_queue(queue)
+
+    spawn = client.spawn_task(queue, "task", {"value": 1})
+    claim = client.claim_tasks(queue)[0]
+    client.complete_run(queue, claim["run_id"], {"value": "done"})
+
+    savepoint = "checkpoint_terminal"
+    client.conn.execute(f"savepoint {savepoint}")
+    with pytest.raises(Exception, match="Cannot checkpoint terminal"):
+        client.set_task_checkpoint_state(
+            queue,
+            spawn.task_id,
+            "too-late",
+            {"value": "orphan"},
+            claim["run_id"],
+        )
+    client.conn.execute(f"rollback to savepoint {savepoint}")
+    client.conn.execute(f"release savepoint {savepoint}")
+
+    assert client.get_checkpoint(queue, spawn.task_id, "too-late") is None
+
+
 def test_checkpoint_preloading_survives_retry(client):
     queue = "checkpoint-retry"
     client.create_queue(queue)
