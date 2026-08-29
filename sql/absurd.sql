@@ -1704,6 +1704,7 @@ create function absurd.await_event (
   language plpgsql
 as $$
 declare
+  v_run_task_id uuid;
   v_run_state text;
   v_existing_payload jsonb;
   v_event_payload jsonb;
@@ -1727,6 +1728,23 @@ begin
   end if;
 
   v_available_at := coalesce(v_timeout_at, 'infinity'::timestamptz);
+
+  execute format(
+    'select task_id
+       from absurd.%I
+      where run_id = $1',
+    'r_' || p_queue_name
+  )
+  into v_run_task_id
+  using p_run_id;
+
+  if v_run_task_id is null then
+    raise exception 'Run "%" not found while awaiting event', p_run_id;
+  end if;
+
+  if v_run_task_id <> p_task_id then
+    raise exception 'Run "%" does not belong to task "%" in queue "%"', p_run_id, p_task_id, p_queue_name;
+  end if;
 
   execute format(
     'select state
@@ -1767,7 +1785,7 @@ begin
   ) using p_event_name;
 
   execute format(
-    'select r.state, r.event_payload, r.wake_event, t.state
+    'select r.task_id, r.state, r.event_payload, r.wake_event, t.state
        from absurd.%I r
        join absurd.%I t on t.task_id = r.task_id
       where r.run_id = $1
@@ -1775,11 +1793,15 @@ begin
     'r_' || p_queue_name,
     't_' || p_queue_name
   )
-  into v_run_state, v_existing_payload, v_wake_event, v_task_state
+  into v_run_task_id, v_run_state, v_existing_payload, v_wake_event, v_task_state
   using p_run_id;
 
   if v_run_state is null then
     raise exception 'Run "%" not found while awaiting event', p_run_id;
+  end if;
+
+  if v_run_task_id <> p_task_id then
+    raise exception 'Run "%" does not belong to task "%" in queue "%"', p_run_id, p_task_id, p_queue_name;
   end if;
 
   if v_task_state = 'cancelled' then
@@ -1812,6 +1834,18 @@ begin
     raise exception 'Run "%" must be running to await events', p_run_id;
   end if;
 
+  -- A timeout wake-up wins over an event emitted after the wait expired.
+  -- emit_event deliberately excludes expired waits, so consuming that later
+  -- global event here would disagree with the wake-up decision already made.
+  if v_wake_event = p_event_name and v_existing_payload is null then
+    execute format(
+      'update absurd.%I set wake_event = null where run_id = $1',
+      'r_' || p_queue_name
+    ) using p_run_id;
+    return query select false, null::jsonb;
+    return;
+  end if;
+
   if v_resolved_payload is null and v_event_payload is not null then
     v_resolved_payload := v_event_payload;
   end if;
@@ -1828,17 +1862,6 @@ begin
       'c_' || p_queue_name
     ) using p_task_id, p_step_name, v_resolved_payload, p_run_id, v_now;
     return query select false, v_resolved_payload;
-    return;
-  end if;
-
-  -- Detect if we resumed due to timeout: wake_event matches and payload is null
-  if v_resolved_payload is null and v_wake_event = p_event_name and v_existing_payload is null then
-    -- Resumed due to timeout; don't re-sleep and don't create a new wait
-    execute format(
-      'update absurd.%I set wake_event = null where run_id = $1',
-      'r_' || p_queue_name
-    ) using p_run_id;
-    return query select false, null::jsonb;
     return;
   end if;
 

@@ -162,6 +162,82 @@ def test_await_event_timeout_does_not_recreate_wait(client):
     assert wait_count_final == 0
 
 
+def test_await_event_requires_run_task_match_before_side_effects(client):
+    queue = "event-run-match"
+    client.create_queue(queue)
+
+    first = client.spawn_task(queue, "first", {"value": 1})
+    second = client.spawn_task(queue, "second", {"value": 2})
+    claims = client.claim_tasks(queue, worker="worker", qty=2)
+    claims_by_task = {claim["task_id"]: claim for claim in claims}
+    first_run = claims_by_task[first.task_id]["run_id"]
+    second_run = claims_by_task[second.task_id]["run_id"]
+    client.set_task_checkpoint_state(
+        queue, second.task_id, "cached", {"value": "cached"}, second_run
+    )
+
+    first_run_before = client.get_run(queue, first_run)
+    second_task_before = client.get_task(queue, second.task_id)
+    for step_name in ("missing", "cached"):
+        savepoint = f"event_run_task_match_{step_name}"
+        client.conn.execute(f"savepoint {savepoint}")
+        with pytest.raises(Exception, match="does not belong"):
+            client.await_event(
+                queue,
+                second.task_id,
+                first_run,
+                step_name,
+                f"event-{step_name}",
+            )
+        client.conn.execute(f"rollback to savepoint {savepoint}")
+        client.conn.execute(f"release savepoint {savepoint}")
+
+    assert client.get_run(queue, first_run) == first_run_before
+    assert client.get_task(queue, second.task_id) == second_task_before
+    event_count = client.conn.execute(
+        sql.SQL("select count(*) from absurd.{table}").format(
+            table=client.get_table("e", queue)
+        )
+    ).fetchone()[0]
+    wait_count = client.conn.execute(
+        sql.SQL("select count(*) from absurd.{table}").format(
+            table=client.get_table("w", queue)
+        )
+    ).fetchone()[0]
+    assert event_count == 0
+    assert wait_count == 0
+
+
+def test_timeout_resume_ignores_event_emitted_after_expiry(client):
+    queue = "event-late-after-timeout"
+    event_name = "late-event"
+    step_name = "wait"
+    client.create_queue(queue)
+
+    now = datetime(2024, 5, 1, 10, 0, tzinfo=timezone.utc)
+    client.set_fake_now(now)
+    spawn = client.spawn_task(queue, "waiter", {"value": 1})
+    claim = client.claim_tasks(queue)[0]
+
+    first = client.await_event(
+        queue, spawn.task_id, claim["run_id"], step_name, event_name, 0
+    )
+    assert first == {"should_suspend": True, "payload": None}
+
+    client.emit_event(queue, event_name, {"late": True})
+    resumed = client.claim_tasks(queue)[0]
+    second = client.await_event(
+        queue, spawn.task_id, resumed["run_id"], step_name, event_name, 0
+    )
+    assert second == {"should_suspend": False, "payload": None}
+    assert client.get_checkpoint(queue, spawn.task_id, step_name) is None
+
+    run = client.get_run(queue, resumed["run_id"])
+    assert run["state"] == "running"
+    assert run["wake_event"] is None
+    assert run["event_payload"] is None
+
+
 def test_await_emit_event_race_does_not_lose_wakeup(db_dsn):
     """
     Regression test for the "lost wakeup" race between await_event() and emit_event().
