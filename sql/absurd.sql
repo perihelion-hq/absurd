@@ -1470,6 +1470,7 @@ create function absurd.set_task_checkpoint_state (
 as $$
 declare
   v_now timestamptz := absurd.current_time();
+  v_run_task_id uuid;
   v_new_attempt integer;
   v_existing_attempt integer;
   v_existing_owner uuid;
@@ -1481,18 +1482,23 @@ begin
   end if;
 
   execute format(
-    'select r.attempt, r.state, t.state
+    'select r.task_id, r.attempt, r.state, t.state
        from absurd.%I r
        join absurd.%I t on t.task_id = r.task_id
-      where r.run_id = $1',
+      where r.run_id = $1
+      for update of r',
     'r_' || p_queue_name,
     't_' || p_queue_name
   )
-  into v_new_attempt, v_run_state, v_task_state
+  into v_run_task_id, v_new_attempt, v_run_state, v_task_state
   using p_owner_run;
 
-  if v_new_attempt is null then
+  if v_run_task_id is null then
     raise exception 'Run "%" not found for checkpoint', p_owner_run;
+  end if;
+
+  if v_run_task_id <> p_task_id then
+    raise exception 'Run "%" does not belong to task "%" in queue "%"', p_owner_run, p_task_id, p_queue_name;
   end if;
 
   if v_task_state = 'cancelled' then
@@ -1501,6 +1507,13 @@ begin
 
   if v_run_state = 'failed' then
     raise exception sqlstate 'AB002' using message = format('Run "%s" has already failed in queue "%s"', p_owner_run, p_queue_name);
+  end if;
+
+  if v_task_state in ('completed', 'failed') or v_run_state in ('completed', 'cancelled') then
+    raise exception 'Cannot checkpoint terminal run "%" or task "%" in queue "%"',
+      p_owner_run,
+      p_task_id,
+      p_queue_name;
   end if;
 
   -- Extend the claim if requested
