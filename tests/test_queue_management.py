@@ -428,12 +428,12 @@ def test_create_queue_rejects_unknown_storage_mode(client):
 
 
 def test_queue_name_validation_limits(client):
-    max_len_queue = "q" * 57
+    max_len_queue = "q" * 53
     client.create_queue(max_len_queue)
     assert max_len_queue in client.list_queues()
 
     with pytest.raises(Exception):
-        client.create_queue("q" * 58)
+        client.create_queue("q" * 54)
 
 
 def test_queue_name_validation_allows_permissive_postgres_names(client):
