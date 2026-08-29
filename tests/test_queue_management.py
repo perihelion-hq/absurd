@@ -121,6 +121,86 @@ def test_cleanup_events_skips_event_locked_by_emission(db_dsn):
             cleanup.execute("select absurd.drop_queue(%s)", (queue,))
 
 
+def test_cleanup_tasks_rejects_invalid_limit(client):
+    queue = "cleanup-invalid-task-limit"
+    client.create_queue(queue)
+    spawn = client.spawn_task(queue, "task", {"value": 1})
+    claim = client.claim_tasks(queue)[0]
+    client.complete_run(queue, claim["run_id"])
+
+    for invalid_limit in (None, 0, -1):
+        savepoint = f"cleanup_tasks_limit_{str(invalid_limit).replace('-', 'n')}"
+        client.conn.execute(f"savepoint {savepoint}")
+        with pytest.raises(Exception, match="cleanup limit must be at least 1"):
+            client.cleanup_tasks(queue, ttl_seconds=0, limit=invalid_limit)
+        client.conn.execute(f"rollback to savepoint {savepoint}")
+        client.conn.execute(f"release savepoint {savepoint}")
+
+    assert client.get_task(queue, spawn.task_id) is not None
+
+
+@pytest.mark.parametrize("storage_mode", ("unpartitioned", "partitioned"))
+def test_cleanup_tasks_skips_task_locked_by_retry(db_dsn, storage_mode):
+    queue = f"cleanup-retry-{storage_mode}"
+
+    try:
+        with psycopg.connect(db_dsn, autocommit=True) as setup:
+            setup.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+            task_id, failed_run_id = setup.execute(
+                """
+                select task_id, run_id
+                from absurd.spawn_task(%s, 'cleanup-race', '{}'::jsonb, '{}'::jsonb)
+                """,
+                (queue,),
+            ).fetchone()
+            setup.execute(
+                sql.SQL(
+                    "update absurd.{run} set state = 'failed', "
+                    "failed_at = clock_timestamp() - interval '1 hour' where run_id = %s"
+                ).format(run=sql.Identifier(f"r_{queue}")),
+                (failed_run_id,),
+            )
+            setup.execute(
+                sql.SQL(
+                    "update absurd.{task} set state = 'failed', attempts = 1 "
+                    "where task_id = %s"
+                ).format(task=sql.Identifier(f"t_{queue}")),
+                (task_id,),
+            )
+
+        with psycopg.connect(db_dsn) as retrying:
+            pending_run_id = retrying.execute(
+                "select run_id from absurd.retry_task(%s, %s)", (queue, task_id)
+            ).fetchone()[0]
+
+            with psycopg.connect(db_dsn, autocommit=True) as cleaner:
+                cleaner.execute("set lock_timeout = '500ms'")
+                deleted = cleaner.execute(
+                    "select absurd.cleanup_tasks(%s, 0, 1)", (queue,)
+                ).fetchone()[0]
+                assert deleted == 0
+
+        with psycopg.connect(db_dsn, autocommit=True) as check:
+            task = check.execute(
+                sql.SQL(
+                    "select state, attempts, last_attempt_run from absurd.{task} "
+                    "where task_id = %s"
+                ).format(task=sql.Identifier(f"t_{queue}")),
+                (task_id,),
+            ).fetchone()
+            assert task == ("pending", 2, pending_run_id)
+            runs = check.execute(
+                sql.SQL(
+                    "select run_id, state from absurd.{run} where task_id = %s order by attempt"
+                ).format(run=sql.Identifier(f"r_{queue}")),
+                (task_id,),
+            ).fetchall()
+            assert runs == [(failed_run_id, "failed"), (pending_run_id, "pending")]
+    finally:
+        with psycopg.connect(db_dsn, autocommit=True) as cleanup:
+            cleanup.execute("select absurd.drop_queue(%s)", (queue,))
+
+
 def test_queue_management_round_trip(client):
     client.create_queue("main")
     client.create_queue("main")

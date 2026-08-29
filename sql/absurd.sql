@@ -2156,6 +2156,10 @@ begin
     raise exception 'TTL must be a non-negative number of seconds';
   end if;
 
+  if p_limit is null or p_limit < 1 then
+    raise exception 'cleanup limit must be at least 1';
+  end if;
+
   v_cutoff := v_now - (p_ttl_seconds * interval '1 second');
 
   select storage_mode into v_storage_mode
@@ -2168,25 +2172,25 @@ begin
     -- Delete in order: wait registrations, checkpoints, runs, idempotency keys,
     -- then tasks.
     execute format(
-      'with eligible_tasks as (
-          select t.task_id,
-                 case
+      'with to_delete as (
+          select t.task_id
+            from absurd.%1$I t
+            left join absurd.%2$I r on r.run_id = t.last_attempt_run
+           where t.state in (''completed'', ''failed'', ''cancelled'')
+             and case
                    when t.state = ''completed'' then r.completed_at
                    when t.state = ''failed'' then r.failed_at
                    when t.state = ''cancelled'' then t.cancelled_at
                    else null
-                 end as terminal_at
-            from absurd.%1$I t
-            left join absurd.%2$I r on r.run_id = t.last_attempt_run
-           where t.state in (''completed'', ''failed'', ''cancelled'')
-       ),
-       to_delete as (
-          select task_id
-            from eligible_tasks
-           where terminal_at is not null
-             and terminal_at < $1
-           order by terminal_at
+                 end < $1
+           order by case
+                      when t.state = ''completed'' then r.completed_at
+                      when t.state = ''failed'' then r.failed_at
+                      when t.state = ''cancelled'' then t.cancelled_at
+                      else null
+                    end
            limit $2
+           for update of t skip locked
        ),
        del_waits as (
           delete from absurd.%3$I w
@@ -2222,25 +2226,25 @@ begin
     -- Unpartitioned queues keep idempotency key ownership on the task row,
     -- so no side-table cleanup is needed.
     execute format(
-      'with eligible_tasks as (
-          select t.task_id,
-                 case
+      'with to_delete as (
+          select t.task_id
+            from absurd.%1$I t
+            left join absurd.%2$I r on r.run_id = t.last_attempt_run
+           where t.state in (''completed'', ''failed'', ''cancelled'')
+             and case
                    when t.state = ''completed'' then r.completed_at
                    when t.state = ''failed'' then r.failed_at
                    when t.state = ''cancelled'' then t.cancelled_at
                    else null
-                 end as terminal_at
-            from absurd.%1$I t
-            left join absurd.%2$I r on r.run_id = t.last_attempt_run
-           where t.state in (''completed'', ''failed'', ''cancelled'')
-       ),
-       to_delete as (
-          select task_id
-            from eligible_tasks
-           where terminal_at is not null
-             and terminal_at < $1
-           order by terminal_at
+                 end < $1
+           order by case
+                      when t.state = ''completed'' then r.completed_at
+                      when t.state = ''failed'' then r.failed_at
+                      when t.state = ''cancelled'' then t.cancelled_at
+                      else null
+                    end
            limit $2
+           for update of t skip locked
        ),
        del_waits as (
           delete from absurd.%3$I w
