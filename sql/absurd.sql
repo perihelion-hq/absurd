@@ -2258,15 +2258,20 @@ begin
     raise exception 'TTL must be a non-negative number of seconds';
   end if;
 
+  if p_limit is null or p_limit < 1 then
+    raise exception 'cleanup limit must be at least 1';
+  end if;
+
   v_cutoff := v_now - (p_ttl_seconds * interval '1 second');
 
   execute format(
     'with to_delete as (
-        select event_name
-          from absurd.%I
-         where emitted_at < $1
-         order by emitted_at
+        select e.event_name
+          from absurd.%I e
+         where e.emitted_at < $1
+         order by e.emitted_at
          limit $2
+         for update of e skip locked
      ),
      del_events as (
         delete from absurd.%I e
