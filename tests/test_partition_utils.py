@@ -72,8 +72,8 @@ def test_partition_week_tag_uses_iso_year_at_start_boundary(client):
     ).fetchone()
 
     assert row is not None
-    assert row[0] == "053"
-    assert row[0][1:] != "00"
+    assert row[0] == "202053"
+    assert row[0][-2:] != "00"
 
 
 def test_partition_week_tag_uses_iso_year_at_end_boundary(client):
@@ -83,4 +83,20 @@ def test_partition_week_tag_uses_iso_year_at_end_boundary(client):
     ).fetchone()
 
     assert row is not None
-    assert row[0] == "501"
+    assert row[0] == "202501"
+
+
+def test_partition_week_tag_is_unique_across_decades_and_fits_identifiers(client):
+    row = client.conn.execute(
+        """
+        select absurd.partition_week_tag('2024-01-01 00:00:00+00'),
+               absurd.partition_week_tag('2034-01-02 00:00:00+00'),
+               length(absurd.partition_week_tag('10889-01-10 00:00:00+00')),
+               octet_length(
+                 't_' || repeat('q', 53) || '_' ||
+                 absurd.partition_week_tag('10889-01-10 00:00:00+00')
+               )
+        """
+    ).fetchone()
+
+    assert row == ("202401", "203401", 7, 63)
