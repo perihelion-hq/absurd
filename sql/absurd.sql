@@ -1516,19 +1516,6 @@ begin
       p_queue_name;
   end if;
 
-  -- Extend the claim if requested
-  if p_extend_claim_by is not null and p_extend_claim_by > 0 then
-    execute format(
-      'update absurd.%I
-          set claim_expires_at = $2 + make_interval(secs => $3)
-        where run_id = $1
-          and state = ''running''
-          and claim_expires_at is not null',
-      'r_' || p_queue_name
-    )
-    using p_owner_run, v_now, p_extend_claim_by;
-  end if;
-
   execute format(
     'select c.owner_run_id,
             r.attempt
@@ -1554,6 +1541,20 @@ begin
       'c_' || p_queue_name
     ) using p_task_id, p_step_name, p_state, p_owner_run, v_now;
   end if;
+
+  -- Extend the claim if requested, after the checkpoint write: that write can wait behind
+  -- another transaction, and the renewal must count from when the claim is written.
+  if p_extend_claim_by is not null and p_extend_claim_by > 0 then
+    execute format(
+      'update absurd.%I
+          set claim_expires_at = $2 + make_interval(secs => $3)
+        where run_id = $1
+          and state = ''running''
+          and claim_expires_at is not null',
+      'r_' || p_queue_name
+    )
+    using p_owner_run, absurd.current_time(), p_extend_claim_by;
+  end if;
 end;
 $$;
 
@@ -1566,7 +1567,7 @@ create function absurd.extend_claim (
   language plpgsql
 as $$
 declare
-  v_now timestamptz := absurd.current_time();
+  v_now timestamptz;
   v_task_state text;
   v_run_state text;
   v_claim_expires_at timestamptz;
@@ -1607,6 +1608,10 @@ begin
   if v_claim_expires_at is null then
     raise exception 'Run "%" does not have an active claim in queue "%"', p_run_id, p_queue_name;
   end if;
+
+  -- Renew from when the claim is written: the row lock above can wait behind another
+  -- transaction, and a time read before that wait can renew to an expiry already past.
+  v_now := absurd.current_time();
 
   execute format(
     'update absurd.%I
