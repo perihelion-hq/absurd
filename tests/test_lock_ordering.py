@@ -520,11 +520,9 @@ def test_cleanup_tasks_bounds_its_pages_behind_a_long_locked_prefix(db_dsn):
                     """
                 ).format(total=sql.Literal(total), queue=sql.Literal(queue))
             )
-            ordered = sql.SQL(
-                "select t.task_id from absurd.{t} t "
-                "join absurd.{r} r on r.run_id = t.last_attempt_run "
-                "order by r.completed_at, t.task_id"
-            ).format(t=sql.Identifier(f"t_{queue}"), r=sql.Identifier(f"r_{queue}"))
+            ordered = sql.SQL("select task_id from absurd.{} order by task_id").format(
+                sql.Identifier(f"t_{queue}")
+            )
             tasks = [row[0] for row in conn.execute(ordered)]
             assert len(tasks) == total
             runs_xmax = sql.SQL(
@@ -547,5 +545,123 @@ def test_cleanup_tasks_bounds_its_pages_behind_a_long_locked_prefix(db_dsn):
                 locked_after = sum(after[run] != before[run] for run in before)
                 assert 0 < locked_after < 1000, locked_after
                 locker.rollback()
+        finally:
+            conn.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+@pytest.mark.parametrize("storage_mode", ("unpartitioned", "partitioned"))
+def test_cleanup_tasks_takes_eligible_tasks_in_task_id_order(db_dsn, storage_mode):
+    """Cleanup walks task_id order, not terminal-time order.
+
+    The task created first but finished last is still the first one deleted,
+    and a task that is terminal but younger than the TTL is never deleted.
+    """
+    queue = f"cleanup_order_{storage_mode[0]}"
+    with psycopg.connect(db_dsn, autocommit=True) as conn:
+        conn.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+        try:
+            first, second, recent = [
+                conn.execute(
+                    "select task_id, run_id from absurd.spawn_task(%s, %s, '{}')",
+                    (queue, name),
+                ).fetchone()
+                for name in ("first", "second", "recent")
+            ]
+            for (task_id, run_id), age in (
+                (first, "1 hour"),
+                (second, "2 hours"),
+                (recent, "0"),
+            ):
+                conn.execute(
+                    sql.SQL(
+                        "update absurd.{} set state = 'completed', "
+                        "completed_at = clock_timestamp() - %s::interval where run_id = %s"
+                    ).format(sql.Identifier(f"r_{queue}")),
+                    (age, run_id),
+                )
+                conn.execute(
+                    sql.SQL(
+                        "update absurd.{} set state = 'completed' where task_id = %s"
+                    ).format(sql.Identifier(f"t_{queue}")),
+                    (task_id,),
+                )
+            assert first[0] < second[0] < recent[0]
+            assert conn.execute(
+                "select absurd.cleanup_tasks(%s, 600, 1)", (queue,)
+            ).fetchone() == (1,)
+            assert _remaining_tasks(conn, queue) == {second[0], recent[0]}
+            assert conn.execute(
+                "select absurd.cleanup_tasks(%s, 600, 10)", (queue,)
+            ).fetchone() == (1,)
+            assert _remaining_tasks(conn, queue) == {recent[0]}
+        finally:
+            conn.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+@pytest.mark.parametrize("storage_mode", ("unpartitioned", "partitioned"))
+def test_cleanup_tasks_reads_history_once_behind_a_long_locked_prefix(
+    db_dsn, storage_mode
+):
+    """Moving past locked tasks continues an index walk instead of rescanning.
+
+    The terminal time spans the task and run tables and has no index, so a
+    page ordered by it scans, joins and sorts the queue's whole history.  With
+    the oldest 15000 of 30000 eligible tasks locked and p_limit = 1, cleanup must
+    reach the first unlocked task without one such scan per page.
+    """
+    queue = f"cleanup_history_{storage_mode[0]}"
+    total, locked = 30000, 15000
+    with psycopg.connect(db_dsn, autocommit=True) as conn:
+        conn.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+        try:
+            conn.execute(
+                "select absurd.spawn_task(%s, 't' || i, '{}') from generate_series(1, %s) i",
+                (queue, total),
+            )
+            conn.execute(
+                sql.SQL(
+                    "update absurd.{} set state = 'completed', "
+                    "completed_at = clock_timestamp() - interval '1 day'"
+                ).format(sql.Identifier(f"r_{queue}"))
+            )
+            conn.execute(
+                sql.SQL("update absurd.{} set state = 'completed'").format(
+                    sql.Identifier(f"t_{queue}")
+                )
+            )
+            conn.execute(
+                sql.SQL("analyze absurd.{}, absurd.{}").format(
+                    sql.Identifier(f"t_{queue}"), sql.Identifier(f"r_{queue}")
+                )
+            )
+            tasks = [
+                row[0]
+                for row in conn.execute(
+                    sql.SQL("select task_id from absurd.{} order by task_id").format(
+                        sql.Identifier(f"t_{queue}")
+                    )
+                )
+            ]
+            task_scans = (
+                "select coalesce(sum(seq_scan), 0) from pg_stat_xact_user_tables "
+                "where schemaname = 'absurd' and (relname = %s or relname like %s)"
+            )
+            with psycopg.connect(db_dsn) as locker, psycopg.connect(db_dsn) as cleaner:
+                locker.execute(
+                    sql.SQL(
+                        "select 1 from absurd.{} where task_id = any(%s) for update"
+                    ).format(sql.Identifier(f"t_{queue}")),
+                    (tasks[:locked],),
+                )
+                pattern = (f"t_{queue}", f"t\\_{queue}\\_%")
+                before = cleaner.execute(task_scans, pattern).fetchone()[0]
+                assert cleaner.execute(
+                    "select absurd.cleanup_tasks(%s, 0, 1)", (queue,)
+                ).fetchone() == (1,)
+                scans = cleaner.execute(task_scans, pattern).fetchone()[0] - before
+                cleaner.commit()
+                locker.rollback()
+            assert scans == 0, scans
+            assert _remaining_tasks(conn, queue) == set(tasks) - {tasks[locked]}
         finally:
             conn.execute("select absurd.drop_queue(%s)", (queue,))
