@@ -468,9 +468,10 @@ begin
   -- drop_queue() takes them in (row, then tables).  Taking table locks first
   -- (CREATE INDEX IF NOT EXISTS locks an existing table) and the row later, as
   -- ensure_claim_function() does, deadlocks with a concurrent drop_queue().
-  -- After waiting for a drop, the row is gone and there is nothing to ensure.
   -- A caller without UPDATE on absurd.queues cannot lock the row; it reads
-  -- the row unlocked and gets no claim function (ensure_claim_function()).
+  -- the row unlocked, is not serialized with drop_queue() (it never waits for
+  -- the row, so the two cannot deadlock either), and gets no claim function
+  -- (ensure_claim_function()).
   begin
     select q.storage_mode into v_storage_mode
       from absurd.queues q
@@ -483,8 +484,10 @@ begin
        where q.queue_name = p_queue_name;
   end;
 
+  -- No row: the queue never existed, or a concurrent drop_queue() removed it
+  -- while this waited for the row.
   if v_storage_mode is null then
-    return;
+    raise exception 'Queue "%" does not exist', p_queue_name;
   end if;
 
   if v_storage_mode not in ('unpartitioned', 'partitioned') then
@@ -1326,11 +1329,11 @@ $$;
 -- with a run or the task row locked by someone else are skipped (left for a
 -- later call), and eligibility is checked again once the task is locked.
 --
--- Skipped tasks do not count against p_limit.  Candidates are read in pages,
--- in (terminal timestamp, task_id) order and each no larger than the number of
--- deletions still allowed, until p_limit tasks are deleted or no eligible task
--- is left, so a locked oldest task does not stall cleanup and concurrent
--- cleanups move on past each other's tasks.
+-- Skipped tasks do not count against p_limit.  The eligible tasks are read
+-- through one ordered cursor, so the candidate query runs once per call, in
+-- chunks no larger than the number of deletions still allowed, until p_limit
+-- tasks are deleted or the cursor is exhausted.  A locked oldest task does not
+-- stall cleanup, and concurrent cleanups move on past each other's tasks.
 --
 -- Returns the number of tasks deleted.
 create or replace function absurd.cleanup_tasks (
@@ -1345,12 +1348,12 @@ declare
   v_now timestamptz := absurd.current_time();
   v_cutoff timestamptz;
   v_deleted_count integer := 0;
-  v_page_deleted integer;
+  v_chunk_deleted integer;
   v_storage_mode text := 'unpartitioned';
+  v_candidates refcursor;
+  v_candidate uuid;
   v_task_ids uuid[];
   v_locked_run_ids uuid[];
-  v_after_terminal_at timestamptz;
-  v_after_task_id uuid;
 begin
   if p_ttl_seconds is null or p_ttl_seconds < 0 then
     raise exception 'TTL must be a non-negative number of seconds';
@@ -1368,39 +1371,39 @@ begin
 
   v_storage_mode := coalesce(v_storage_mode, 'unpartitioned');
 
+  -- 1. The eligible tasks, oldest first, without locking anything yet.  A task
+  --    is eligible once it is terminal and its terminal timestamp (that of its
+  --    latest run for completed and failed tasks) is older than the cutoff.
+  open v_candidates no scroll for execute format(
+    'select t.task_id
+       from absurd.%1$I t
+       left join absurd.%2$I r on r.run_id = t.last_attempt_run
+      where t.state in (''completed'', ''failed'', ''cancelled'')
+        and case
+              when t.state = ''completed'' then r.completed_at
+              when t.state = ''failed'' then r.failed_at
+              when t.state = ''cancelled'' then t.cancelled_at
+              else null
+            end < $1
+      order by case
+                 when t.state = ''completed'' then r.completed_at
+                 when t.state = ''failed'' then r.failed_at
+                 when t.state = ''cancelled'' then t.cancelled_at
+                 else null
+               end,
+               t.task_id',
+    't_' || p_queue_name,
+    'r_' || p_queue_name
+  )
+  using v_cutoff;
+
   while v_deleted_count < p_limit loop
-    -- 1. The next page of eligible tasks after the last one looked at, without
-    --    locking anything yet.  A task is eligible once it is terminal and its
-    --    terminal timestamp (that of its latest run for completed and failed
-    --    tasks) is older than the cutoff.
-    execute format(
-      'select coalesce(array_agg(e.task_id order by e.terminal_at, e.task_id), ''{}''),
-              (array_agg(e.terminal_at order by e.terminal_at desc, e.task_id desc))[1],
-              (array_agg(e.task_id order by e.terminal_at desc, e.task_id desc))[1]
-         from (
-           select t.task_id, x.terminal_at
-             from absurd.%1$I t
-             left join absurd.%2$I r on r.run_id = t.last_attempt_run
-            cross join lateral (
-              select case
-                       when t.state = ''completed'' then r.completed_at
-                       when t.state = ''failed'' then r.failed_at
-                       when t.state = ''cancelled'' then t.cancelled_at
-                       else null
-                     end as terminal_at
-            ) x
-            where t.state in (''completed'', ''failed'', ''cancelled'')
-              and x.terminal_at < $1
-              and ($3::timestamptz is null
-                   or (x.terminal_at, t.task_id) > ($3::timestamptz, $4::uuid))
-            order by x.terminal_at, t.task_id
-            limit $2
-         ) e',
-      't_' || p_queue_name,
-      'r_' || p_queue_name
-    )
-    into v_task_ids, v_after_terminal_at, v_after_task_id
-    using v_cutoff, p_limit - v_deleted_count, v_after_terminal_at, v_after_task_id;
+    v_task_ids := '{}';
+    while cardinality(v_task_ids) < p_limit - v_deleted_count loop
+      fetch v_candidates into v_candidate;
+      exit when not found;
+      v_task_ids := v_task_ids || v_candidate;
+    end loop;
 
     exit when cardinality(v_task_ids) = 0;
 
@@ -1492,9 +1495,11 @@ begin
       't_' || p_queue_name
     ) using v_task_ids;
 
-    get diagnostics v_page_deleted = row_count;
-    v_deleted_count := v_deleted_count + v_page_deleted;
+    get diagnostics v_chunk_deleted = row_count;
+    v_deleted_count := v_deleted_count + v_chunk_deleted;
   end loop;
+
+  close v_candidates;
 
   return v_deleted_count;
 end;

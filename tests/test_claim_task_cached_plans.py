@@ -1406,6 +1406,14 @@ def test_repeated_create_queue_and_drop_queue_do_not_deadlock(
         admin.execute("select absurd.drop_queue(%s)", (queue,))
 
 
+def test_ensure_queue_tables_refuses_a_queue_without_registry_row(admin):
+    with pytest.raises(psycopg.errors.RaiseException, match="does not exist"):
+        admin.execute("select absurd.ensure_queue_tables('cf_unregistered')")
+    assert admin.execute(
+        "select to_regclass('absurd.t_cf_unregistered')"
+    ).fetchone() == (None,)
+
+
 def test_queue_manager_without_update_on_the_registry_manages_queues(admin, db_dsn):
     # Locking the queue's row needs UPDATE on absurd.queues.  A role that may
     # only insert and delete registry rows still creates (on claim_task()'s
