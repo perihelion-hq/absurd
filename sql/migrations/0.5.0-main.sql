@@ -1337,10 +1337,13 @@ $$;
 -- concurrent cleanups move on past each other's tasks.  The terminal timestamp
 -- has no index, so every page scans the eligible backlog and keeps only its
 -- page in a top-N sort.  The first page holds p_limit tasks, as one batch did
--- before; a page after one that skipped tasks is twice as large (and never
--- smaller than the deletions still allowed), so skipping K locked tasks costs
--- about log2(K) scans instead of one scan per skipped task, and no page sorts
--- more than about twice the tasks examined.  Locks taken for a task that is
+-- before; each later page is twice as large as the one before (and never
+-- smaller than the deletions still allowed), so skipping K locked tasks takes
+-- far fewer scans than one per skipped task.  No page holds more than 1000
+-- tasks, whatever p_limit or the number of locked tasks: a page's candidates
+-- are held in arrays and their runs are locked before locked tasks are
+-- rejected, so a long locked prefix with an unbounded page would make a small
+-- cleanup hold and lock backlog-sized batches.  Locks taken for a task that is
 -- then skipped or left over are released again (see step 2 and 3 below).
 --
 -- Returns the number of tasks deleted.
@@ -1363,7 +1366,8 @@ declare
   v_accepted_ids uuid[];
   v_after_terminal_at timestamptz;
   v_after_task_id uuid;
-  v_page_size bigint := p_limit;
+  v_max_page_size constant integer := 1000;
+  v_page_size integer;
 begin
   if p_ttl_seconds is null or p_ttl_seconds < 0 then
     raise exception 'TTL must be a non-negative number of seconds';
@@ -1380,10 +1384,14 @@ begin
   where queue_name = p_queue_name;
 
   v_storage_mode := coalesce(v_storage_mode, 'unpartitioned');
+  v_page_size := least(p_limit, v_max_page_size);
 
   while v_deleted_count < p_limit loop
     if v_after_task_id is not null then
-      v_page_size := greatest(v_page_size * 2, p_limit - v_deleted_count);
+      v_page_size := least(
+        greatest(v_page_size * 2, p_limit - v_deleted_count),
+        v_max_page_size
+      );
     end if;
 
     -- 1. The next page of eligible tasks after the last one looked at, without

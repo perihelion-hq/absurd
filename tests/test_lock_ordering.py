@@ -485,3 +485,67 @@ def test_cleanup_tasks_past_locked_tasks_deletes_no_more_than_the_limit(
                 locker.rollback()
         finally:
             conn.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+def test_cleanup_tasks_bounds_its_pages_behind_a_long_locked_prefix(db_dsn):
+    """A long locked prefix must not grow a small cleanup's pages to backlog size.
+
+    Each page's runs are locked (and released again with the page's
+    subtransaction) before locked tasks are rejected.  With the oldest 2100 of
+    4200 eligible tasks locked and p_limit = 1, the page that reaches the first
+    unlocked task holds at most 1000 tasks, so at most 999 tasks after it have
+    their runs locked; an unbounded doubling page would reach about 2000 of
+    them.  A row a rolled-back subtransaction locked keeps that locker in its
+    xmax, so a run whose xmax changed during the call was locked by it.
+    """
+    queue = "cleanup_page_cap"
+    total, locked = 4200, 2100
+    with psycopg.connect(db_dsn, autocommit=True) as conn:
+        conn.execute("select absurd.create_queue(%s)", (queue,))
+        try:
+            conn.execute(
+                sql.SQL(
+                    """
+                    do $$
+                    declare r record;
+                    begin
+                      for i in 1..{total} loop
+                        perform absurd.spawn_task({queue}, 't' || i, '{{}}');
+                      end loop;
+                      for r in select * from absurd.claim_task({queue}, 'w', 60, {total})
+                      loop
+                        perform absurd.complete_run({queue}, r.run_id, null);
+                      end loop;
+                    end $$
+                    """
+                ).format(total=sql.Literal(total), queue=sql.Literal(queue))
+            )
+            ordered = sql.SQL(
+                "select t.task_id from absurd.{t} t "
+                "join absurd.{r} r on r.run_id = t.last_attempt_run "
+                "order by r.completed_at, t.task_id"
+            ).format(t=sql.Identifier(f"t_{queue}"), r=sql.Identifier(f"r_{queue}"))
+            tasks = [row[0] for row in conn.execute(ordered)]
+            assert len(tasks) == total
+            runs_xmax = sql.SQL(
+                "select run_id, xmax::text from absurd.{} where task_id = any(%s)"
+            ).format(sql.Identifier(f"r_{queue}"))
+            later = tasks[locked + 1 :]
+            before = dict(conn.execute(runs_xmax, (later,)).fetchall())
+            with psycopg.connect(db_dsn) as locker:
+                locker.execute(
+                    sql.SQL(
+                        "select 1 from absurd.{} where task_id = any(%s) for update"
+                    ).format(sql.Identifier(f"t_{queue}")),
+                    (tasks[:locked],),
+                )
+                assert conn.execute(
+                    "select absurd.cleanup_tasks(%s, 0, 1)", (queue,)
+                ).fetchone() == (1,)
+                assert _remaining_tasks(conn, queue) == set(tasks) - {tasks[locked]}
+                after = dict(conn.execute(runs_xmax, (later,)).fetchall())
+                locked_after = sum(after[run] != before[run] for run in before)
+                assert 0 < locked_after < 1000, locked_after
+                locker.rollback()
+        finally:
+            conn.execute("select absurd.drop_queue(%s)", (queue,))
