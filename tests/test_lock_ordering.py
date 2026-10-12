@@ -409,9 +409,26 @@ def test_cleanup_tasks_moves_past_a_locked_oldest_task(db_dsn, storage_mode, loc
                     table, key = f"r_{queue}", oldest_run
                 locker.execute(sql.SQL(statement).format(sql.Identifier(table)), (key,))
 
-                assert conn.execute(
-                    "select absurd.cleanup_tasks(%s, 0, 1)", (queue,)
-                ).fetchone() == (1,)
+                with psycopg.connect(db_dsn) as cleaner:
+                    assert cleaner.execute(
+                        "select absurd.cleanup_tasks(%s, 0, 1)", (queue,)
+                    ).fetchone() == (1,)
+                    # While the cleanup is uncommitted, it holds no lock on
+                    # the skipped task or its runs, nor on the newest task.
+                    for table, column, key in (
+                        (f"t_{queue}", "task_id", oldest),
+                        (f"r_{queue}", "run_id", oldest_run),
+                        (f"t_{queue}", "task_id", newest),
+                    ):
+                        if key == (oldest if locked == "task" else oldest_run):
+                            continue  # held by the locker
+                        conn.execute(
+                            sql.SQL(
+                                "select 1 from absurd.{} where {} = %s for update nowait"
+                            ).format(sql.Identifier(table), sql.Identifier(column)),
+                            (key,),
+                        )
+                    cleaner.commit()
                 assert _remaining_tasks(conn, queue) == {oldest, newest}
                 locker.rollback()
 
@@ -440,5 +457,31 @@ def test_concurrent_cleanups_delete_different_tasks(db_dsn, storage_mode):
                 ).fetchone() == (1,)
                 first.commit()
             assert _remaining_tasks(conn, queue) == {newest}
+        finally:
+            conn.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+@pytest.mark.parametrize("storage_mode", ("unpartitioned", "partitioned"))
+def test_cleanup_tasks_past_locked_tasks_deletes_no_more_than_the_limit(
+    db_dsn, storage_mode
+):
+    """A larger page read after skipped tasks still deletes at most p_limit."""
+    queue = f"cleanup_cap_{storage_mode[0]}"
+    with psycopg.connect(db_dsn, autocommit=True) as conn:
+        conn.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+        try:
+            tasks = [task_id for task_id, _ in _completed_tasks(conn, queue, 6)]
+            with psycopg.connect(db_dsn) as locker:
+                locker.execute(
+                    sql.SQL(
+                        "select 1 from absurd.{} where task_id = any(%s) for update"
+                    ).format(sql.Identifier(f"t_{queue}")),
+                    (tasks[:2],),
+                )
+                assert conn.execute(
+                    "select absurd.cleanup_tasks(%s, 0, 2)", (queue,)
+                ).fetchone() == (2,)
+                assert _remaining_tasks(conn, queue) == {*tasks[:2], *tasks[4:]}
+                locker.rollback()
         finally:
             conn.execute("select absurd.drop_queue(%s)", (queue,))

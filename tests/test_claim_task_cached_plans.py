@@ -1197,6 +1197,43 @@ def test_migration_refuses_partition_renames_onto_another_queue_and_changes_noth
         ] == ["t"]
 
 
+def test_migration_renames_a_partition_created_concurrently(new_database, admin):
+    # absurdctl applies the migration statement by statement.  A 0.5.0
+    # ensure_partitions() that creates old-style partitions in a transaction
+    # still uncommitted when the rename statement starts must not leave them
+    # behind under their old tags once both have committed.
+    dsn = new_database("cf_mig_concurrent")
+    migration = migration_sql()
+    split = migration.index("-- Make weekly partition tags year-unique")
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(ABSURD_0_5_0.read_text())
+        conn.execute("select absurd.create_queue('busy', 'partitioned')")
+        conn.execute(migration[:split])
+
+        with psycopg.connect(dsn) as maintainer, psycopg.connect(dsn) as migrator:
+            maintainer.execute(
+                "select set_config('absurd.fake_now', %s, false)",
+                (datetime(2031, 6, 2, 12, tzinfo=timezone.utc).isoformat(),),
+            )
+            maintainer.execute("select absurd.ensure_partitions('busy')")
+            thread, migrated = _start(migrator, migration[split:], None)
+            _finished_or_waiting(admin, thread, migrator.info.backend_pid)
+            maintainer.commit()
+            thread.join(30)
+            assert not thread.is_alive()
+            assert migrated == {"ok": True}, migrated.get("error")
+
+        assert conn.execute("select absurd.get_schema_version()").fetchone() == (
+            "main",
+        )
+        assert conn.execute(
+            "select relname from pg_class where relname ~ '^[trcw]_busy_[0-9]{3}$'"
+        ).fetchall() == []
+        assert conn.execute(
+            "select count(*) from pg_class where relname ~ '^t_busy_2031[0-9]{2}$'"
+        ).fetchone()[0] > 0
+
+
 def claim_fn_exists_conn(conn, queue):
     return conn.execute(
         "select count(*) from pg_proc where proname = %s "
