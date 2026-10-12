@@ -195,41 +195,50 @@ $$;
 -- so it cannot be pointed at another queue.  Names that would not fit into a
 -- 63-byte identifier (possible only for queues created under older, longer
 -- naming limits) get no function and keep using claim_task()'s dynamic path.
+--
+-- The function is owned by the owner of the queue's tables, whichever role
+-- runs this (a migration role, a superuser, or the queue owner itself), so the
+-- queue owner can always replace it (create_queue) and drop it (drop_queue).
+-- If the caller cannot create the function or hand it to that owner, no
+-- function is created and claim_task() keeps using its dynamic statements.
+--
+-- Being a separate function, it has its own EXECUTE privilege: claim_task()
+-- only dispatches to it for a caller that holds EXECUTE on it, so installations
+-- that revoke PUBLIC EXECUTE keep working through the dynamic path until the
+-- worker role is granted EXECUTE on absurd.ct_<queue>(text, integer, integer).
 create function absurd.ensure_claim_function (p_queue_name text)
   returns void
   language plpgsql
 as $$
 declare
   v_fn_name text := 'ct_' || p_queue_name;
+  v_table_owner oid;
+  v_fn_owner oid;
+  v_body text;
 begin
   if octet_length(v_fn_name) > 63 then
     return;
   end if;
 
-  execute format(
-    $tmpl$
-create or replace function absurd.%4$I (
-  p_worker_id text,
-  p_claim_timeout integer default 30,
-  p_qty integer default 1
-)
-  returns table (
-    run_id uuid,
-    task_id uuid,
-    attempt integer,
-    task_name text,
-    params jsonb,
-    retry_strategy jsonb,
-    max_attempts integer,
-    headers jsonb,
-    wake_event text,
-    event_payload jsonb
-  )
-  language plpgsql
-as $fn$
+  -- The function must belong to whoever owns the queue's tables, so that role
+  -- (and not the role that happened to run this) can later replace or drop it.
+  select c.relowner into v_table_owner
+    from pg_catalog.pg_class c
+   where c.relnamespace = 'absurd'::regnamespace
+     and c.relname = 't_' || p_queue_name;
+
+  if v_table_owner is null then
+    return;
+  end if;
+
+  -- The body goes into the CREATE FUNCTION statement as a quoted literal
+  -- (%2$L below), never inside a dollar-quote delimiter, so no queue name can
+  -- terminate it early.
+  v_body := format(
+    $body$
 #variable_conflict use_column
 declare
-  v_queue_name constant text := %5$L;
+  v_queue_name constant text := %4$L;
   v_now timestamptz := absurd.current_time();
   v_claim_timeout integer := greatest(coalesce(p_claim_timeout, 30), 0);
   v_worker_id text := coalesce(nullif(p_worker_id, ''), 'worker');
@@ -356,14 +365,61 @@ begin
   join absurd.%2$I t on t.task_id = u.task_id
   order by r.available_at, u.run_id;
 end;
-$fn$;
-    $tmpl$,
+$body$,
     'r_' || p_queue_name,
     't_' || p_queue_name,
     'w_' || p_queue_name,
-    v_fn_name,
     p_queue_name
   );
+
+  begin
+    execute format(
+      $tmpl$
+create or replace function absurd.%1$I (
+  p_worker_id text,
+  p_claim_timeout integer default 30,
+  p_qty integer default 1
+)
+  returns table (
+    run_id uuid,
+    task_id uuid,
+    attempt integer,
+    task_name text,
+    params jsonb,
+    retry_strategy jsonb,
+    max_attempts integer,
+    headers jsonb,
+    wake_event text,
+    event_payload jsonb
+  )
+  language plpgsql
+as %2$L
+      $tmpl$,
+      v_fn_name,
+      v_body
+    );
+
+    select p.proowner into v_fn_owner
+      from pg_catalog.pg_proc p
+     where p.proname = v_fn_name
+       and p.pronamespace = 'absurd'::regnamespace
+       and p.proargtypes = '25 23 23'::oidvector;
+
+    if v_fn_owner <> v_table_owner then
+      execute format(
+        'alter function absurd.%I(text, integer, integer) owner to %I',
+        v_fn_name,
+        pg_catalog.pg_get_userbyid(v_table_owner)
+      );
+    end if;
+  exception
+    when insufficient_privilege then
+      -- The caller may not create or replace the function, or may not hand it
+      -- to the table owner.  The whole block is rolled back, so no function
+      -- owned by the wrong role is left behind; claim_task() keeps using its
+      -- dynamic statements for this queue.
+      raise notice 'Not creating claim function absurd.%: %', v_fn_name, sqlerrm;
+  end;
 end;
 $$;
 
@@ -1127,10 +1183,10 @@ create function absurd.claim_task (
   language plpgsql
 as $$
 declare
-  v_now timestamptz := absurd.current_time();
-  v_claim_timeout integer := greatest(coalesce(p_claim_timeout, 30), 0);
-  v_worker_id text := coalesce(nullif(p_worker_id, ''), 'worker');
-  v_qty integer := greatest(coalesce(p_qty, 1), 1);
+  v_now timestamptz;
+  v_claim_timeout integer;
+  v_worker_id text;
+  v_qty integer;
   v_claim_until timestamptz := null;
   v_sql text;
   v_expired_run record;
@@ -1141,17 +1197,29 @@ begin
   -- Prefer the per-queue function created by ensure_claim_function(): its
   -- statements are static SQL, so their plans are cached.  Queues without one
   -- (created before it existed and not yet migrated, or with an over-long
-  -- legacy name) use the dynamic statements below.
+  -- legacy name) use the dynamic statements below, and so does a caller that
+  -- lacks EXECUTE on it: this function is SECURITY INVOKER, so the generated
+  -- function does not inherit the caller's EXECUTE on claim_task().
+  --
+  -- Everything the dynamic statements need is initialized below this check so
+  -- the fast path does no other work.
   if exists (
     select 1
       from pg_catalog.pg_proc p
      where p.proname = v_fn_name
        and p.pronamespace = 'absurd'::regnamespace
+       and p.proargtypes = '25 23 23'::oidvector
+       and pg_catalog.has_function_privilege(p.oid, 'execute')
   ) then
     return query execute format('select * from absurd.%I($1, $2, $3)', v_fn_name)
       using p_worker_id, p_claim_timeout, p_qty;
     return;
   end if;
+
+  v_now := absurd.current_time();
+  v_claim_timeout := greatest(coalesce(p_claim_timeout, 30), 0);
+  v_worker_id := coalesce(nullif(p_worker_id, ''), 'worker');
+  v_qty := greatest(coalesce(p_qty, 1), 1);
 
   if v_claim_timeout > 0 then
     v_claim_until := v_now + make_interval(secs => v_claim_timeout);

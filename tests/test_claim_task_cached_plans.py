@@ -54,6 +54,76 @@ def run_states(client, queue, task_id):
     return [r["state"] for r in client.get_runs(queue, task_id)]
 
 
+def install_sentinel(conn, queue):
+    """Replace ct_<queue> with a function that reveals it was the one called."""
+    conn.execute(
+        f"""
+        create or replace function absurd.{_ident(f"ct_{queue}")} (
+          p_worker_id text, p_claim_timeout integer default 30, p_qty integer default 1
+        )
+          returns table (
+            run_id uuid, task_id uuid, attempt integer, task_name text,
+            params jsonb, retry_strategy jsonb, max_attempts integer,
+            headers jsonb, wake_event text, event_payload jsonb
+          )
+          language sql
+        as $$
+          select null::uuid, null::uuid, 0,
+                 'sentinel ' || p_worker_id || p_claim_timeout || p_qty,
+                 null::jsonb, null::jsonb, null::integer, null::jsonb,
+                 null::text, null::jsonb
+        $$
+        """
+    )
+
+
+def _ident(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def claim_fn_owner(conn, queue):
+    row = conn.execute(
+        """
+        select pg_get_userbyid(p.proowner)
+        from pg_proc p
+        where p.proname = %s and p.pronamespace = 'absurd'::regnamespace
+        """,
+        (f"ct_{queue}",),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def table_owner(conn, queue):
+    return conn.execute(
+        "select pg_get_userbyid(relowner) from pg_class "
+        "where relnamespace = 'absurd'::regnamespace and relname = %s",
+        (f"t_{queue}",),
+    ).fetchone()[0]
+
+
+@pytest.fixture
+def admin(db_dsn):
+    """A committing superuser session, for state other sessions must see.
+
+    The shared test database is rolled back per test; anything this fixture's
+    users create (queues, roles) is removed again by the test.
+    """
+    with psycopg.connect(db_dsn, autocommit=True) as conn:
+        yield conn
+
+
+def drop_roles(conn, *roles):
+    for role in roles:
+        conn.execute(sql.SQL("drop owned by {}").format(sql.Identifier(role)))
+        conn.execute(sql.SQL("drop role {}").format(sql.Identifier(role)))
+
+
+def as_role(db_dsn, role):
+    conn = psycopg.connect(db_dsn, autocommit=True)
+    conn.execute(sql.SQL("set role {}").format(sql.Identifier(role)))
+    return conn
+
+
 # -- lifecycle of the generated function ------------------------------------
 
 
@@ -119,25 +189,7 @@ def test_claim_task_dispatches_to_per_queue_function_and_falls_back(client):
     client.spawn_task(queue, "real", {})
 
     # Replace the generated function with a sentinel: claim_task must call it.
-    client.conn.execute(
-        f"""
-        create or replace function absurd.ct_{queue} (
-          p_worker_id text, p_claim_timeout integer default 30, p_qty integer default 1
-        )
-          returns table (
-            run_id uuid, task_id uuid, attempt integer, task_name text,
-            params jsonb, retry_strategy jsonb, max_attempts integer,
-            headers jsonb, wake_event text, event_payload jsonb
-          )
-          language sql
-        as $$
-          select null::uuid, null::uuid, 0,
-                 'sentinel ' || p_worker_id || p_claim_timeout || p_qty,
-                 null::jsonb, null::jsonb, null::integer, null::jsonb,
-                 null::text, null::jsonb
-        $$
-        """
-    )
+    install_sentinel(client.conn, queue)
     rows = client.claim_tasks(queue, worker="w", claim_timeout=7, qty=3)
     assert [r["task_name"] for r in rows] == ["sentinel w73"]
 
@@ -153,11 +205,7 @@ def test_unknown_queue_still_raises_undefined_table(client):
 
 
 def test_migration_creates_claim_functions_for_existing_queues(client):
-    migration = next(
-        p
-        for p in sorted(MIGRATIONS.glob("*.sql"))
-        if "ensure_claim_function" in p.read_text()
-    )
+    migration = migration_sql()
     queues = ["cf_mig_a", "cf_mig_b"]
     for q in queues:
         client.create_queue(q)
@@ -166,12 +214,240 @@ def test_migration_creates_claim_functions_for_existing_queues(client):
     for q in queues:
         drop_claim_fn(client, q)  # a queue as created by the previous release
 
-    client.conn.execute(migration.read_text())
+    client.conn.execute(migration)
 
     for q in queues:
         assert claim_fn_exists(client, q)
         client.spawn_task(q, "t", {})
         assert [r["task_name"] for r in client.claim_tasks(q)] == ["t"]
+
+
+def migration_sql():
+    return next(
+        p
+        for p in sorted(MIGRATIONS.glob("*.sql"))
+        if "ensure_claim_function" in p.read_text()
+    ).read_text()
+
+
+# -- privileges and ownership -------------------------------------------------
+
+
+def test_claim_task_uses_per_queue_function_only_when_caller_may_execute_it(
+    admin, db_dsn
+):
+    # Installations that revoke PUBLIC EXECUTE and grant workers EXECUTE on the
+    # API functions grant nothing on ct_<queue>; claim_task() is SECURITY
+    # INVOKER, so dispatching anyway would fail with permission denied.
+    queue = "cf_priv"
+    role = "cf_priv_worker"
+    admin.execute("select absurd.create_queue(%s)", (queue,))
+    try:
+        admin.execute(sql.SQL("create role {}").format(sql.Identifier(role)))
+        admin.execute(
+            sql.SQL("grant usage on schema absurd to {}").format(sql.Identifier(role))
+        )
+        for prefix in "trcew":
+            admin.execute(
+                sql.SQL(
+                    "grant select, insert, update, delete on absurd.{} to {}"
+                ).format(sql.Identifier(f"{prefix}_{queue}"), sql.Identifier(role))
+            )
+        ct = sql.SQL("absurd.{}(text, integer, integer)").format(
+            sql.Identifier(f"ct_{queue}")
+        )
+        # The marker lets the test see which path served a claim.
+        install_sentinel(admin, queue)
+        admin.execute(sql.SQL("revoke execute on function {} from public").format(ct))
+
+        spawn = lambda name: admin.execute(  # noqa: E731
+            "select absurd.spawn_task(%s, %s, '{}')", (queue, name)
+        )
+
+        def claim():
+            with as_role(db_dsn, role) as worker:
+                return [
+                    r[3]
+                    for r in worker.execute(
+                        "select * from absurd.claim_task(%s, 'w', 60, 1)", (queue,)
+                    ).fetchall()
+                ]
+
+        # No EXECUTE on ct_<queue>: served by the dynamic statements.
+        spawn("slow-1")
+        assert claim() == ["slow-1"]
+
+        # With EXECUTE it takes the generated function.
+        admin.execute(
+            sql.SQL("grant execute on function {} to {}").format(
+                ct, sql.Identifier(role)
+            )
+        )
+        spawn("ignored")
+        assert claim() == ["sentinel w601"]
+
+        # Revoking it again goes back to the dynamic statements.
+        admin.execute(
+            sql.SQL("revoke execute on function {} from {}").format(
+                ct, sql.Identifier(role)
+            )
+        )
+        assert claim() == ["ignored"]
+    finally:
+        admin.execute("select absurd.drop_queue(%s)", (queue,))
+        drop_roles(admin, role)
+
+
+def test_claim_task_ignores_per_queue_function_with_other_signature(client):
+    queue = "cf_sig"
+    client.create_queue(queue)
+    client.spawn_task(queue, "real", {})
+    drop_claim_fn(client, queue)
+    client.conn.execute(
+        sql.SQL(
+            "create function absurd.{}(text) returns void language sql as 'select'"
+        ).format(sql.Identifier(f"ct_{queue}"))
+    )
+    assert [r["task_name"] for r in client.claim_tasks(queue)] == ["real"]
+
+
+def test_claim_function_is_owned_by_the_queue_owner_across_roles(admin, db_dsn):
+    # A queue owner that is neither a superuser nor the role that installs or
+    # migrates Absurd must be able to create_queue (idempotently) and
+    # drop_queue, which replace and drop ct_<queue>.
+    queue = "cf_own"
+    owner, migrator, other = "cf_own_owner", "cf_own_migrator", "cf_own_other"
+    try:
+        admin.execute(
+            sql.SQL("create role {} superuser").format(sql.Identifier(migrator))
+        )
+        for role in (owner, other):
+            admin.execute(sql.SQL("create role {}").format(sql.Identifier(role)))
+            admin.execute(
+                sql.SQL("grant usage, create on schema absurd to {}").format(
+                    sql.Identifier(role)
+                )
+            )
+            admin.execute(
+                sql.SQL(
+                    "grant select, insert, update, delete on absurd.queues to {}"
+                ).format(sql.Identifier(role))
+            )
+
+        with as_role(db_dsn, owner) as conn:
+            conn.execute("select absurd.create_queue(%s)", (queue,))
+            assert claim_fn_owner(conn, queue) == owner
+            # The queue as created by the previous release: no function.
+            conn.execute(
+                sql.SQL("drop function absurd.{}(text, integer, integer)").format(
+                    sql.Identifier(f"ct_{queue}")
+                )
+            )
+        assert claim_fn_owner(admin, queue) is None
+
+        # A different role applies the migration; it must not end up owning
+        # the queue's function.
+        with as_role(db_dsn, migrator) as conn:
+            conn.execute(migration_sql())
+        assert table_owner(admin, queue) == owner
+        assert claim_fn_owner(admin, queue) == owner
+
+        with as_role(db_dsn, owner) as conn:
+            conn.execute("select absurd.create_queue(%s)", (queue,))  # replaces it
+            assert claim_fn_owner(conn, queue) == owner
+
+        # A role that owns neither the tables nor the function, and cannot
+        # become the owner, neither breaks nor replaces it.
+        with as_role(db_dsn, other) as conn:
+            conn.execute("select absurd.ensure_claim_function(%s)", (queue,))
+        assert claim_fn_owner(admin, queue) == owner
+
+        with as_role(db_dsn, owner) as conn:
+            conn.execute("select absurd.drop_queue(%s)", (queue,))
+        assert claim_fn_owner(admin, queue) is None
+
+        # ... and without a function it creates none (the caller could not give
+        # it to the table owner), leaving claim_task() on its dynamic path.
+        with as_role(db_dsn, owner) as conn:
+            conn.execute("select absurd.create_queue(%s)", (queue,))
+            conn.execute(
+                sql.SQL("drop function absurd.{}(text, integer, integer)").format(
+                    sql.Identifier(f"ct_{queue}")
+                )
+            )
+        with as_role(db_dsn, other) as conn:
+            conn.execute("select absurd.ensure_claim_function(%s)", (queue,))
+        assert claim_fn_owner(admin, queue) is None
+        admin.execute("select absurd.spawn_task(%s, 't', '{}')", (queue,))
+        assert [
+            r[3]
+            for r in admin.execute("select * from absurd.claim_task(%s, 'w')", (queue,))
+        ] == ["t"]
+    finally:
+        admin.execute("select absurd.drop_queue(%s)", (queue,))
+        drop_roles(admin, owner, other, migrator)
+
+
+# -- queue names that are hostile to quoting ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "queue",
+    ("dq$fn$x", "dq$body$x", "dq$$x", "dq'x", 'dq"x', "dq\\x", "$fn$'\"$$"),
+)
+def test_hostile_queue_names_get_a_working_claim_function(client, queue):
+    # validate_queue_name() only checks length, so any of these is a valid
+    # queue name and must not break out of the generated CREATE FUNCTION.
+    client.create_queue(queue)
+    assert claim_fn_exists(client, queue)
+    spawn = client.spawn_task(queue, "t", {})
+    assert [r["run_id"] for r in client.claim_tasks(queue)] == [spawn.run_id]
+    assert client.claim_tasks(queue) == []
+
+    migration = migration_sql()
+    drop_claim_fn(client, queue)
+    client.conn.execute(migration)  # the backfill creates it again
+    assert claim_fn_exists(client, queue)
+
+    client.drop_queue(queue)
+    assert not claim_fn_exists(client, queue)
+
+
+def test_migration_renames_existing_partitions_to_year_unique_tags(client):
+    queue = "cf_mig_tags"
+    client.create_queue(queue, storage_mode="partitioned")
+    weekly = r"^[trcw]_cf_mig_tags_[0-9]{6}$"
+    names = [
+        r[0]
+        for r in client.conn.execute(
+            "select relname from pg_class where relname ~ %s order by 1", (weekly,)
+        )
+    ]
+    assert len(names) >= 4 and len(names) % 4 == 0
+
+    # Partitions as named by 0.5.0: the tag was one year digit plus the week.
+    for name in names:
+        client.conn.execute(
+            sql.SQL("alter table absurd.{} rename to {}").format(
+                sql.Identifier(name), sql.Identifier(name[:-6] + name[-3:])
+            )
+        )
+
+    client.conn.execute(migration_sql())
+
+    renamed = [
+        r[0]
+        for r in client.conn.execute(
+            "select relname from pg_class where relname ~ %s order by 1", (weekly,)
+        )
+    ]
+    assert renamed == names
+    # No overlapping partition is created next to the existing ones.
+    client.conn.execute("select absurd.ensure_partitions(%s)", (queue,))
+    count = client.conn.execute(
+        "select count(*) from pg_class where relname ~ '^[trcw]_cf_mig_tags_[0-9]+$'"
+    ).fetchone()[0]
+    assert count == len(names)
 
 
 def test_repeated_polls_on_one_session(client):
@@ -228,6 +504,26 @@ def test_claim_orders_by_available_at_then_run_id_and_honours_qty(
     second = client.claim_tasks(queue, worker="w2", qty=5)
     assert [r["run_id"] for r in second] == [a.run_id]
     assert client.claim_tasks(queue) == []
+
+
+@pytest.mark.parametrize("storage_mode", ("unpartitioned", "partitioned"))
+def test_claim_breaks_available_at_ties_by_run_id(make_queue, client, storage_mode):
+    queue = make_queue(f"tie_{storage_mode}", storage_mode)
+    client.set_fake_now(BASE)
+    spawns = [client.spawn_task(queue, f"t{i}", {}) for i in range(6)]
+    run_ids = sorted(s.run_id for s in spawns)
+    available = {client.get_run(queue, r)["available_at"] for r in run_ids}
+    assert available == {BASE}
+
+    client.set_fake_now(BASE + timedelta(seconds=1))
+    # Which runs are picked, and in which order they come back, is decided by
+    # run_id alone since every available_at is the same.
+    first = client.claim_tasks(queue, qty=2)
+    assert [r["run_id"] for r in first] == run_ids[:2]
+    second = client.claim_tasks(queue, qty=3)
+    assert [r["run_id"] for r in second] == run_ids[2:5]
+    third = client.claim_tasks(queue, qty=3)
+    assert [r["run_id"] for r in third] == run_ids[5:]
 
 
 def test_claim_defaults_for_empty_worker_and_null_timeout(make_queue, client):

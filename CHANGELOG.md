@@ -4,7 +4,8 @@ This contains the changes between releases.
 
 # Unreleased
 
-* Improved `absurd.claim_task()` polling cost: each queue now gets a generated `absurd.ct_<queue>` function holding the claim statements as static SQL, so PostgreSQL caches their plans instead of re-planning dynamic SQL on every poll.  `claim_task()` keeps its signature and semantics and falls back to its previous dynamic statements for queues without a generated function.  The `0.5.0-main` migration creates the functions for existing queues.
+* Improved `absurd.claim_task()` polling cost: each queue now gets a generated `absurd.ct_<queue>` function holding the claim statements as static SQL, so PostgreSQL caches their plans instead of re-planning dynamic SQL on every poll.  `claim_task()` keeps its signature and semantics and falls back to its previous dynamic statements for queues without a generated function and for callers without `EXECUTE` on it.  The function is owned by the owner of the queue's tables.
+* Added the `0.5.0-main` migration.  Besides creating the claim functions for existing queues, it carries every other change to `sql/absurd.sql` since 0.5.0: checkpoint and event-wait run ownership checks (`set_task_checkpoint_state`, `await_event`), preserved expired event waits, serialized `cleanup_tasks`/`cleanup_events` with a minimum limit of 1, the 53-byte queue name limit (`validate_queue_name`), and year-unique weekly partition tags (`partition_week_tag`; existing weekly partitions are renamed).
 
 # 0.5.0
 
