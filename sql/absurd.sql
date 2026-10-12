@@ -370,6 +370,23 @@ $body$,
     p_queue_name
   );
 
+  -- Nothing to do when the generated function is already in place.  Replacing
+  -- it anyway would write a new pg_proc row on every create_queue(),
+  -- invalidating every session's cached claim plans, and two transactions
+  -- repeating create_queue() for the same queue would collide on that row
+  -- ("tuple concurrently updated").
+  if exists (
+    select 1
+      from pg_catalog.pg_proc p
+     where p.pronamespace = 'absurd'::regnamespace
+       and p.proname = v_fn_name
+       and p.proargtypes = '25 23 23'::oidvector
+       and p.proowner = v_table_owner
+       and p.prosrc = v_body
+  ) then
+    return;
+  end if;
+
   begin
     execute format(
       $tmpl$

@@ -28,8 +28,12 @@
 -- No row data is rewritten.  Function definitions are replaced, claim
 -- functions are created, and the existing weekly partitions of partitioned
 -- queues (and the indexes named after them) are renamed to the new tags.
--- Everything runs in the transaction of the script, so a failure leaves the
--- 0.5.0 schema untouched.  Safe to re-run.
+-- This file contains no BEGIN/COMMIT.  Apply it as one transaction (for
+-- example psql -v ON_ERROR_STOP=1 -1 -f ...) so a failure leaves the 0.5.0
+-- schema untouched.  With ON_ERROR_STOP alone (as absurdctl migrate applies
+-- it) psql stops at the first error but keeps the statements that already
+-- ran.  The preflight below runs first and changes nothing either way.  Safe
+-- to re-run.
 
 do $$
 declare
@@ -266,6 +270,23 @@ $body$,
     'w_' || p_queue_name,
     p_queue_name
   );
+
+  -- Nothing to do when the generated function is already in place.  Replacing
+  -- it anyway would write a new pg_proc row on every create_queue(),
+  -- invalidating every session's cached claim plans, and two transactions
+  -- repeating create_queue() for the same queue would collide on that row
+  -- ("tuple concurrently updated").
+  if exists (
+    select 1
+      from pg_catalog.pg_proc p
+     where p.pronamespace = 'absurd'::regnamespace
+       and p.proname = v_fn_name
+       and p.proargtypes = '25 23 23'::oidvector
+       and p.proowner = v_table_owner
+       and p.prosrc = v_body
+  ) then
+    return;
+  end if;
 
   begin
     execute format(

@@ -69,7 +69,7 @@ Then apply it with your existing migration tool.  If you just want to test the
 SQL manually, you can also apply that file with `psql`:
 
 ```bash
-psql "$PGDATABASE" -f db/migrations/202604010001_absurd_init.sql
+psql "$PGDATABASE" -v ON_ERROR_STOP=1 -1 -f db/migrations/202604010001_absurd_init.sql
 ```
 
 If you need to pin the initial schema to a specific Absurd release, copy the
@@ -138,7 +138,7 @@ as the rest of your database migrations.  For example, to test it directly with
 `psql`:
 
 ```bash
-psql "$PGDATABASE" -f db/migrations/202604010002_absurd_upgrade.sql
+psql "$PGDATABASE" -v ON_ERROR_STOP=1 -1 -f db/migrations/202604010002_absurd_upgrade.sql
 ```
 
 ### Upgrading from 0.5.0: queue names are limited to 53 bytes

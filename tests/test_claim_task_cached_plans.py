@@ -8,6 +8,8 @@ dropped, as for a queue created before the function existed).  All must produce
 the same observable result.
 """
 
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -177,6 +179,84 @@ def test_create_queue_creates_and_drop_queue_removes_claim_function(
 
     client.drop_queue(queue)
     assert not claim_fn_exists(client, queue)
+
+
+def claim_fn_version(conn, queue):
+    """The pg_proc row of ct_<queue>: oid and the xmin of its current version."""
+    return conn.execute(
+        "select p.oid, p.xmin::text from pg_proc p "
+        "where p.proname = %s and p.pronamespace = 'absurd'::regnamespace",
+        (f"ct_{queue}",),
+    ).fetchone()
+
+
+@pytest.mark.parametrize("storage_mode", ("unpartitioned", "partitioned"))
+def test_repeated_create_queue_does_not_rewrite_claim_function(admin, storage_mode):
+    # Replacing an unchanged function would write a new pg_proc row version
+    # (and invalidate every session's cached claim plans) on each create_queue.
+    queue = f"cf_norewrite_{storage_mode}"
+    try:
+        admin.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+        before = claim_fn_version(admin, queue)
+        assert before is not None
+
+        admin.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+        admin.execute("select absurd.ensure_claim_function(%s)", (queue,))
+        assert claim_fn_version(admin, queue) == before
+
+        # A function that differs from the generated one is still replaced.
+        install_sentinel(admin, queue)
+        planted = claim_fn_version(admin, queue)
+        admin.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+        assert claim_fn_version(admin, queue) != planted
+        prosrc = admin.execute(
+            "select prosrc from pg_proc where oid = %s", (planted[0],)
+        ).fetchone()[0]
+        assert "sentinel" not in prosrc
+    finally:
+        admin.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+def test_concurrent_create_queue_on_an_existing_queue(admin, db_dsn):
+    # Two transactions repeating create_queue for an existing queue must not
+    # both try to replace ct_<queue>: the second would wait for the first and
+    # then fail with "tuple concurrently updated".
+    queue = "cf_concurrent"
+    admin.execute("select absurd.create_queue(%s)", (queue,))
+    try:
+        with psycopg.connect(db_dsn) as first, psycopg.connect(db_dsn) as second:
+            first.execute("select absurd.create_queue(%s)", (queue,))  # open txn
+            second_pid = second.info.backend_pid
+            outcome = {}
+
+            def repeat_create():
+                try:
+                    second.execute("select absurd.create_queue(%s)", (queue,))
+                    second.commit()
+                    outcome["ok"] = True
+                except psycopg.Error as exc:  # reported below
+                    second.rollback()
+                    outcome["error"] = exc
+
+            worker = threading.Thread(target=repeat_create, daemon=True)
+            worker.start()
+            # Give the second transaction time to block on the first, if it is
+            # going to.
+            deadline = time.monotonic() + 5
+            while worker.is_alive() and time.monotonic() < deadline:
+                waiting = admin.execute(
+                    "select wait_event_type = 'Lock' from pg_stat_activity where pid = %s",
+                    (second_pid,),
+                ).fetchone()
+                if waiting and waiting[0]:
+                    break
+                time.sleep(0.05)
+            first.commit()
+            worker.join(10)
+            assert not worker.is_alive()
+            assert outcome == {"ok": True}, outcome.get("error")
+    finally:
+        admin.execute("select absurd.drop_queue(%s)", (queue,))
 
 
 def test_claim_function_is_static_sql_and_does_not_widen_privileges(client):
