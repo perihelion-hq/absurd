@@ -429,3 +429,167 @@ def test_await_emit_event_race_does_not_lose_wakeup(db_dsn):
         with psycopg.connect(db_dsn, autocommit=True) as cleanup_conn:
             cleanup_conn.execute("set timezone to 'UTC'")
             cleanup_conn.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+def test_await_event_holds_an_event_row_when_cleanup_deletes_it(db_dsn):
+    """await_event() must end up holding an event row lock, even when the row
+    it found is deleted before it can lock it.
+
+    The row lock is what serializes await_event() with emit_event(): an
+    emission either commits before the waiter looks for the payload, or waits
+    until the waiter's registration is visible.  INSERT ... ON CONFLICT DO
+    NOTHING keeps no lock on an existing row, so cleanup_events() can delete
+    that row before await_event() locks it.  A session that holds the old row
+    while it runs cleanup_events() makes that interleaving deterministic.
+    """
+    queue = "event-cleanup-race"
+    event_name = "cleaned-up-event"
+    emitted = datetime(2024, 6, 1, 10, 0, tzinfo=timezone.utc)
+    later = emitted + timedelta(hours=2)
+    etbl = sql.Identifier(f"e_{queue}")
+    rtbl = sql.Identifier(f"r_{queue}")
+
+    def connect(name, *, autocommit, now):
+        conn = psycopg.connect(db_dsn, autocommit=autocommit)
+        conn.execute(
+            sql.SQL("set absurd.fake_now = {}").format(sql.Literal(now.isoformat()))
+        )
+        conn.execute(sql.SQL("set application_name = {}").format(sql.Literal(name)))
+        conn.execute("set statement_timeout = '10s'")
+        return conn
+
+    def wait_until(predicate, what, timeout_seconds=5.0):
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        raise AssertionError(what)
+
+    def waiting_for_lock(monitor, name):
+        row = monitor.execute(
+            "select wait_event_type from pg_stat_activity where application_name = %s",
+            (name,),
+        ).fetchone()
+        return bool(row and row[0] == "Lock")
+
+    conns = []
+    try:
+        setup = connect("absurd-cleanup-race-setup", autocommit=True, now=emitted)
+        conns.append(setup)
+        setup.execute("select absurd.create_queue(%s)", (queue,))
+        # An old emission that is due for cleanup.
+        setup.execute(
+            "select absurd.emit_event(%s, %s, %s)",
+            (queue, event_name, Jsonb({"old": True})),
+        )
+        setup.execute(
+            sql.SQL("set absurd.fake_now = {}").format(sql.Literal(later.isoformat()))
+        )
+        task_id, run_id = setup.execute(
+            "select task_id, run_id from absurd.spawn_task(%s, 'waiter', '{}', '{}')",
+            (queue,),
+        ).fetchone()
+        assert setup.execute(
+            "select run_id from absurd.claim_task(%s, 'worker', 60, 1)", (queue,)
+        ).fetchone() == (run_id,)
+
+        monitor = connect("absurd-cleanup-race-monitor", autocommit=True, now=later)
+        conns.append(monitor)
+
+        cleaner = connect("absurd-cleanup-race-cleaner", autocommit=False, now=later)
+        conns.append(cleaner)
+        cleaner.execute(
+            sql.SQL("select 1 from absurd.{e} where event_name = %s for update").format(
+                e=etbl
+            ),
+            (event_name,),
+        )
+
+        waiter = connect("absurd-cleanup-race-waiter", autocommit=False, now=later)
+        conns.append(waiter)
+        await_result = {}
+
+        def await_event():
+            try:
+                await_result["row"] = waiter.execute(
+                    "select should_suspend, payload "
+                    "from absurd.await_event(%s, %s, %s, 'step', %s, null)",
+                    (queue, task_id, run_id, event_name),
+                ).fetchone()
+            except Exception as exc:  # surfaced below
+                await_result["exc"] = exc
+
+        awaiting = threading.Thread(target=await_event, daemon=True)
+        awaiting.start()
+        wait_until(
+            lambda: waiting_for_lock(monitor, "absurd-cleanup-race-waiter"),
+            "await_event did not wait for the event row",
+        )
+
+        # Cleanup removes the old event while await_event waits to lock it.
+        assert cleaner.execute(
+            "select absurd.cleanup_events(%s, 3600, 10)", (queue,)
+        ).fetchone() == (1,)
+        cleaner.commit()
+
+        awaiting.join(10)
+        assert not awaiting.is_alive(), "await_event did not finish"
+        if "exc" in await_result:
+            raise await_result["exc"]
+        assert await_result["row"] == (True, None)
+
+        # The waiter's transaction has not committed yet.  A new emission must
+        # not slip past it: it has to wait for the waiter and then wake it.
+        emitter = connect("absurd-cleanup-race-emitter", autocommit=True, now=later)
+        conns.append(emitter)
+        emit_result = {}
+
+        def emit_event():
+            try:
+                emitter.execute(
+                    "select absurd.emit_event(%s, %s, %s)",
+                    (queue, event_name, Jsonb({"new": True})),
+                )
+                emit_result["ok"] = True
+            except Exception as exc:  # surfaced below
+                emit_result["exc"] = exc
+
+        emitting = threading.Thread(target=emit_event, daemon=True)
+        emitting.start()
+        wait_until(
+            lambda: (
+                not emitting.is_alive()
+                or waiting_for_lock(monitor, "absurd-cleanup-race-emitter")
+            ),
+            "emit_event neither finished nor waited",
+        )
+        waiter.commit()
+        emitting.join(10)
+        assert not emitting.is_alive(), "emit_event did not finish"
+        assert emit_result == {"ok": True}, emit_result.get("exc")
+
+        state, wake_event = monitor.execute(
+            sql.SQL(
+                "select state, wake_event from absurd.{r} where run_id = %s"
+            ).format(r=rtbl),
+            (run_id,),
+        ).fetchone()
+        assert (state, wake_event) == ("pending", None)
+        assert monitor.execute(
+            "select run_id from absurd.claim_task(%s, 'worker', 60, 1)", (queue,)
+        ).fetchone() == (run_id,)
+        assert monitor.execute(
+            "select should_suspend, payload "
+            "from absurd.await_event(%s, %s, %s, 'step', %s, null)",
+            (queue, task_id, run_id, event_name),
+        ).fetchone() == (False, {"new": True})
+    finally:
+        for conn in conns:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+        with psycopg.connect(db_dsn, autocommit=True) as conn:
+            conn.execute("select absurd.drop_queue(%s)", (queue,))

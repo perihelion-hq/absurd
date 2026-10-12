@@ -69,7 +69,7 @@ Then apply it with your existing migration tool.  If you just want to test the
 SQL manually, you can also apply that file with `psql`:
 
 ```bash
-psql "$PGDATABASE" -f db/migrations/202604010001_absurd_init.sql
+psql "$PGDATABASE" -v ON_ERROR_STOP=1 -1 -f db/migrations/202604010001_absurd_init.sql
 ```
 
 If you need to pin the initial schema to a specific Absurd release, copy the
@@ -138,8 +138,30 @@ as the rest of your database migrations.  For example, to test it directly with
 `psql`:
 
 ```bash
-psql "$PGDATABASE" -f db/migrations/202604010002_absurd_upgrade.sql
+psql "$PGDATABASE" -v ON_ERROR_STOP=1 -1 -f db/migrations/202604010002_absurd_upgrade.sql
 ```
+
+### Upgrading from 0.5.0: queue names are limited to 53 bytes
+
+Queue names of 54 to 57 bytes were accepted by 0.5.0 but are not supported any
+longer: weekly partition names carry a year-unique tag that makes them three
+bytes longer, and PostgreSQL would truncate them to 63 bytes so that different
+weeks collide.  The `0.5.0-main` migration therefore checks first, before it
+changes anything, and fails with an error listing the affected queues if any
+exists.  To upgrade, drain each listed queue on the 0.5.0 database, drop it
+with `absurd.drop_queue()`, recreate it under a name of at most 53 bytes (and
+point your producers and workers at the new name), and run the migration again.
+The check covers unpartitioned queues too, because the functions that validate
+the queue name reject them.
+
+The migration also renames the weekly partitions of partitioned queues to
+their year-unique tags (`t_jobs_641` becomes `t_jobs_202641`), and checks
+first that no new name is already taken.  A queue named like a partitioned
+queue followed by `_` and six digits (`jobs_202641` beside a partitioned
+`jobs`) owns such names; the migration then fails, before it changes anything,
+with an error listing the colliding renames.  Drain the queue that owns the
+existing relation, drop it with `absurd.drop_queue()`, recreate it under
+another name, and run the migration again.
 
 ## Notes
 

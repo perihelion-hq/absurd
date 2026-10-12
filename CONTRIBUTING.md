@@ -81,6 +81,11 @@ Each queue creates 5 core tables:
 Partitioned queues additionally create:
 - **i_{queue}** - Idempotency key registry
 
+Each queue also gets a generated function **ct_{queue}** (see
+`absurd.ensure_claim_function`) that holds the `claim_task` statements as
+static SQL so their plans are cached.  If you change `claim_task`'s statements,
+change the generated function and the dynamic fallback in `claim_task` together.
+
 ### Notes on Schema
 
 The stored procedures in sql/absurd.sql are the source of truth. The schema includes:
