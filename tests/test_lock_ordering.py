@@ -355,3 +355,90 @@ def test_cleanup_tasks_and_late_extend_claim_do_not_deadlock(db_dsn, storage_mod
 
         with psycopg.connect(db_dsn, autocommit=True) as cleanup_conn:
             cleanup_conn.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+def _completed_tasks(conn, queue, count):
+    """Spawn, claim and complete count tasks, oldest completion first."""
+    task_ids = []
+    for i in range(count):
+        task_id, run_id = conn.execute(
+            "select task_id, run_id from absurd.spawn_task(%s, %s, '{}')",
+            (queue, f"t{i}"),
+        ).fetchone()
+        assert conn.execute(
+            "select run_id from absurd.claim_task(%s, 'w', 60, 1)", (queue,)
+        ).fetchone() == (run_id,)
+        conn.execute("select absurd.complete_run(%s, %s, null)", (queue, run_id))
+        task_ids.append((task_id, run_id))
+    return task_ids
+
+
+def _remaining_tasks(conn, queue):
+    return {
+        r[0]
+        for r in conn.execute(
+            sql.SQL("select task_id from absurd.{}").format(
+                sql.Identifier(f"t_{queue}")
+            )
+        )
+    }
+
+
+@pytest.mark.parametrize("storage_mode", ("unpartitioned", "partitioned"))
+@pytest.mark.parametrize("locked", ("task", "run"))
+def test_cleanup_tasks_moves_past_a_locked_oldest_task(db_dsn, storage_mode, locked):
+    """A locked oldest task must not stall cleanup.
+
+    Skipped tasks do not count against the limit: with p_limit = 1 and the
+    oldest eligible task (or its run) locked elsewhere, cleanup deletes the
+    next eligible task instead of returning 0 on every call.
+    """
+    queue = f"cleanup_skip_{locked}_{storage_mode[0]}"
+    with psycopg.connect(db_dsn, autocommit=True) as conn:
+        conn.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+        try:
+            (oldest, oldest_run), (following, _), (newest, _) = _completed_tasks(
+                conn, queue, 3
+            )
+            with psycopg.connect(db_dsn) as locker:
+                if locked == "task":
+                    statement = "select 1 from absurd.{} where task_id = %s for update"
+                    table, key = f"t_{queue}", oldest
+                else:
+                    statement = "select 1 from absurd.{} where run_id = %s for update"
+                    table, key = f"r_{queue}", oldest_run
+                locker.execute(sql.SQL(statement).format(sql.Identifier(table)), (key,))
+
+                assert conn.execute(
+                    "select absurd.cleanup_tasks(%s, 0, 1)", (queue,)
+                ).fetchone() == (1,)
+                assert _remaining_tasks(conn, queue) == {oldest, newest}
+                locker.rollback()
+
+            assert conn.execute(
+                "select absurd.cleanup_tasks(%s, 0, 10)", (queue,)
+            ).fetchone() == (2,)
+            assert _remaining_tasks(conn, queue) == set()
+        finally:
+            conn.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+@pytest.mark.parametrize("storage_mode", ("unpartitioned", "partitioned"))
+def test_concurrent_cleanups_delete_different_tasks(db_dsn, storage_mode):
+    """A cleanup moves on past the tasks a concurrent cleanup is deleting."""
+    queue = f"cleanup_concurrent_{storage_mode[0]}"
+    with psycopg.connect(db_dsn, autocommit=True) as conn:
+        conn.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+        try:
+            (oldest, _), (following, _), (newest, _) = _completed_tasks(conn, queue, 3)
+            with psycopg.connect(db_dsn) as first:
+                assert first.execute(
+                    "select absurd.cleanup_tasks(%s, 0, 1)", (queue,)
+                ).fetchone() == (1,)
+                assert conn.execute(
+                    "select absurd.cleanup_tasks(%s, 0, 1)", (queue,)
+                ).fetchone() == (1,)
+                first.commit()
+            assert _remaining_tasks(conn, queue) == {newest}
+        finally:
+            conn.execute("select absurd.drop_queue(%s)", (queue,))

@@ -1147,6 +1147,56 @@ def test_migration_twice_on_a_populated_partitioned_queue_from_0_5_0(new_databas
         assert claim_fn_exists_conn(conn, queue)
 
 
+def test_migration_refuses_partition_renames_onto_another_queue_and_changes_nothing(
+    new_database, postgres_container
+):
+    # Partition t_jobs_<3-digit tag> of a partitioned "jobs" queue is renamed
+    # to t_jobs_<IYYYIW>, the task table of a valid 0.5.0 queue "jobs_<IYYYIW>".
+    # The migration must refuse before changing anything, in both ways it is
+    # applied, and run once the documented remediation is done.
+    dbname = "cf_mig_collide"
+    year, week, _ = datetime.now(timezone.utc).isocalendar()
+    tag = f"{year}{week:02d}"
+    with install_0_5_0(new_database, dbname) as conn:
+        conn.execute("select absurd.create_queue('jobs', 'partitioned')")
+        conn.execute("select absurd.create_queue(%s)", (f"jobs_{tag}",))
+        conn.execute("select absurd.spawn_task(%s, 't', '{}')", (f"jobs_{tag}",))
+        old_partition = f"t_jobs_{tag[3:]}"
+        assert conn.execute(
+            "select to_regclass(%s) is not null", (f"absurd.{old_partition}",)
+        ).fetchone() == (True,)
+
+        before = schema_snapshot(conn)
+        with pytest.raises(psycopg.errors.DuplicateTable) as exc:
+            conn.execute(migration_sql())
+        assert f"{old_partition} -> t_jobs_{tag}" in str(exc.value)
+        assert f"{old_partition}_pkey -> t_jobs_{tag}_pkey" in str(exc.value)
+        assert "Nothing has been changed" in exc.value.diag.message_hint
+        assert schema_snapshot(conn) == before
+
+        failed = _apply_like_absurdctl(postgres_container, dbname, migration_sql())
+        assert failed.returncode != 0
+        assert f"{old_partition} -> t_jobs_{tag}" in failed.stderr, failed.stderr
+        assert schema_snapshot(conn) == before
+
+        # The documented remediation: drain, drop and recreate the other queue
+        # under another name, then migrate.
+        conn.execute("select absurd.drop_queue(%s)", (f"jobs_{tag}",))
+        conn.execute("select absurd.create_queue('jobs_current')")
+        rerun = _apply_like_absurdctl(postgres_container, dbname, migration_sql())
+        assert rerun.returncode == 0, rerun.stderr
+        assert conn.execute("select absurd.get_schema_version()").fetchone() == (
+            "main",
+        )
+        assert conn.execute(
+            "select to_regclass(%s) is not null", (f"absurd.t_jobs_{tag}",)
+        ).fetchone() == (True,)
+        conn.execute("select absurd.spawn_task('jobs', 't', '{}')")
+        assert [
+            r[3] for r in conn.execute("select * from absurd.claim_task('jobs', 'w')")
+        ] == ["t"]
+
+
 def claim_fn_exists_conn(conn, queue):
     return conn.execute(
         "select count(*) from pg_proc where proname = %s "
@@ -1300,6 +1350,97 @@ def test_drop_queue_and_claim_function_regeneration_do_not_race(admin, db_dsn, s
             )
         )
         admin.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+@pytest.mark.parametrize("storage_mode", ("unpartitioned", "partitioned"))
+def test_repeated_create_queue_and_drop_queue_do_not_deadlock(
+    admin, db_dsn, storage_mode
+):
+    # create_queue() for an existing queue and drop_queue() must take the
+    # queue's row and its tables in the same order.  A session holding a lock
+    # on the run table stalls create_queue() at its index DDL, so drop_queue()
+    # arrives while the creation is in progress.
+    queue = f"cf_createdrop_{storage_mode[0]}"
+    admin.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+    try:
+        with (
+            psycopg.connect(db_dsn) as reader,
+            psycopg.connect(db_dsn) as creator,
+            psycopg.connect(db_dsn) as dropper,
+        ):
+            for conn in (creator, dropper):
+                conn.execute("set deadlock_timeout = '100ms'")
+                conn.execute("set statement_timeout = '10s'")
+                conn.commit()
+            reader.execute(
+                sql.SQL("lock table absurd.{} in row exclusive mode").format(
+                    sql.Identifier(f"r_{queue}")
+                )
+            )
+            create_thread, created = _start(
+                creator, "select absurd.create_queue(%s, %s)", (queue, storage_mode)
+            )
+            _finished_or_waiting(admin, create_thread, creator.info.backend_pid)
+            assert create_thread.is_alive(), created
+            drop_thread, dropped = _start(
+                dropper, "select absurd.drop_queue(%s)", (queue,)
+            )
+            _finished_or_waiting(admin, drop_thread, dropper.info.backend_pid)
+            reader.rollback()
+            create_thread.join(10)
+            drop_thread.join(10)
+            assert not create_thread.is_alive() and not drop_thread.is_alive()
+            assert created == {"ok": True}, created.get("error")
+            assert dropped == {"ok": True}, dropped.get("error")
+
+        # The creation (of an existing queue) came first, then the drop.
+        assert admin.execute(
+            "select count(*) from absurd.queues where queue_name = %s", (queue,)
+        ).fetchone() == (0,)
+        for prefix in "trcew":
+            assert admin.execute(
+                "select to_regclass(%s)", (f"absurd.{prefix}_{queue}",)
+            ).fetchone() == (None,)
+        assert claim_fn_owner(admin, queue) is None
+    finally:
+        admin.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+def test_queue_manager_without_update_on_the_registry_manages_queues(admin, db_dsn):
+    # Locking the queue's row needs UPDATE on absurd.queues.  A role that may
+    # only insert and delete registry rows still creates (on claim_task()'s
+    # dynamic statements), recreates and drops its queues.
+    queue, role = "cf_noupdate", "cf_noupdate_owner"
+    admin.execute(sql.SQL("create role {}").format(sql.Identifier(role)))
+    try:
+        admin.execute(
+            sql.SQL("grant usage, create on schema absurd to {}").format(
+                sql.Identifier(role)
+            )
+        )
+        admin.execute(
+            sql.SQL("grant select, insert, delete on absurd.queues to {}").format(
+                sql.Identifier(role)
+            )
+        )
+        with as_role(db_dsn, role) as conn:
+            conn.execute("select absurd.create_queue(%s)", (queue,))
+            conn.execute("select absurd.create_queue(%s)", (queue,))
+            assert claim_fn_owner(conn, queue) is None
+            conn.execute("select absurd.spawn_task(%s, 't', '{}')", (queue,))
+            assert [
+                r[3]
+                for r in conn.execute(
+                    "select * from absurd.claim_task(%s, 'w')", (queue,)
+                )
+            ] == ["t"]
+            conn.execute("select absurd.drop_queue(%s)", (queue,))
+        assert admin.execute(
+            "select to_regclass(%s)", (f"absurd.t_{queue}",)
+        ).fetchone() == (None,)
+    finally:
+        admin.execute("select absurd.drop_queue(%s)", (queue,))
+        drop_roles(admin, role)
 
 
 def test_queue_owner_drops_a_queue_whose_claim_function_another_role_owns(

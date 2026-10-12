@@ -154,6 +154,15 @@ point your producers and workers at the new name), and run the migration again.
 The check covers unpartitioned queues too, because the functions that validate
 the queue name reject them.
 
+The migration also renames the weekly partitions of partitioned queues to
+their year-unique tags (`t_jobs_641` becomes `t_jobs_202641`), and checks
+first that no new name is already taken.  A queue named like a partitioned
+queue followed by `_` and six digits (`jobs_202641` beside a partitioned
+`jobs`) owns such names; the migration then fails, before it changes anything,
+with an error listing the colliding renames.  Drain the queue that owns the
+existing relation, drop it with `absurd.drop_queue()`, recreate it under
+another name, and run the migration again.
+
 ## Notes
 
 - `absurdctl init` is for **fresh installs**.

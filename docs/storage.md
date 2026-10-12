@@ -36,9 +36,10 @@ that withhold `PUBLIC` `EXECUTE` and grant it to workers per function need to
 also grant it on `ct_<queue>(text, integer, integer)` to get the cached plans.
 Likewise, `create_queue` generates the function only for a role that may
 execute `absurd.ensure_claim_function(text)` and update `absurd.queues` (it
-locks the queue's row to serialize concurrent generation); otherwise the queue
-is created without it.  `drop_queue` leaves a `ct_<queue>` owned by a role the
-caller cannot act as to that role.
+locks the queue's row to serialize concurrent generation and, before any table
+DDL, to serialize `create_queue` with `drop_queue`); otherwise the queue is
+created without it.  `drop_queue` leaves in place a `ct_<queue>` owned by a role
+the caller cannot act as, for that role to drop later.
 
 ### Trust boundary of `ct_<queue>`
 

@@ -10,6 +10,8 @@
 -- * Tightens set_task_checkpoint_state() and await_event() to verify that the
 --   run belongs to the given task, and makes await_event() prefer a timeout
 --   wake-up over a later event.
+-- * Makes extend_claim() and set_task_checkpoint_state() renew a claim from
+--   when the renewal is written, not from before a row-lock wait.
 -- * Serializes cleanup_tasks() and cleanup_events() with concurrent work
 --   (row locks, skip locked; cleanup_tasks() locks runs before their task)
 --   and rejects a cleanup limit below 1, and makes await_event() keep an event
@@ -27,6 +29,15 @@
 -- the 0.5.0 database drain each listed queue, drop it with absurd.drop_queue()
 -- and recreate it under a name of at most 53 bytes, then apply this migration.
 --
+-- RESTRICTION: no weekly partition may be renamed to a name another relation
+-- already has.  A queue named like a partitioned queue followed by _ and six
+-- digits (for example "jobs_202641" beside a partitioned "jobs") owns the
+-- partitioned queue's new partition names.  The second statement aborts the
+-- migration, before anything is changed, and lists the colliding renames.  To
+-- remediate, drain the queue that owns the existing relation, drop it with
+-- absurd.drop_queue() and recreate it under another name, then apply this
+-- migration.
+--
 -- No row data is rewritten.  Function definitions are replaced, claim
 -- functions are created, and the existing weekly partitions of partitioned
 -- queues (and the indexes named after them) are renamed to the new tags.
@@ -34,7 +45,7 @@
 -- example psql -v ON_ERROR_STOP=1 -1 -f ...) so a failure leaves the 0.5.0
 -- schema untouched.  With ON_ERROR_STOP alone (as absurdctl migrate applies
 -- it) psql stops at the first error but keeps the statements that already
--- ran.  The preflight below runs first and changes nothing either way, the
+-- ran.  The two preflights below run first and change nothing either way, the
 -- partition tag function and the partition renames change together in one
 -- statement, and the new schema version is published by the last statement,
 -- so after a failure the database still reports 0.5.0 and the next migrate
@@ -55,6 +66,83 @@ begin
     raise exception 'Cannot migrate to main: queue names are limited to 53 bytes, but these queues are longer: %', v_queues
       using hint = 'Drain each listed queue, drop it with absurd.drop_queue() and recreate it under a name of at most 53 bytes, then apply this migration again.  Nothing has been changed.',
             errcode = 'check_violation';
+  end if;
+end;
+$$;
+
+-- The weekly partition renames further below must not collide with another
+-- relation.  A partitioned queue's new partition name can be a valid 0.5.0
+-- queue's table name: partition t_jobs_641 of queue "jobs" becomes
+-- t_jobs_202641, the task table of a queue "jobs_202641".  This computes every
+-- rename the way the rename statement does (with the new partition_week_tag()
+-- definition) and aborts, before anything is changed, if a target name is
+-- taken or targeted twice.
+do $$
+declare
+  v_collisions text;
+begin
+  with partitions as (
+    select child.oid as child_oid,
+           child.relname as child_name,
+           parent.relname as parent_name,
+           substring(
+             pg_catalog.pg_get_expr(child.relpartbound, child.oid)
+             from 'FROM \(''([0-9a-f-]{36})'''
+           )::uuid as lower_bound
+      from absurd.queues q
+      join pg_catalog.pg_class parent
+        on parent.relnamespace = 'absurd'::regnamespace
+       and parent.relname in ('t_' || q.queue_name, 'r_' || q.queue_name,
+                              'c_' || q.queue_name, 'w_' || q.queue_name)
+      join pg_catalog.pg_inherits i on i.inhparent = parent.oid
+      join pg_catalog.pg_class child on child.oid = i.inhrelid
+     where q.storage_mode = 'partitioned'
+       and substr(child.relname, length(parent.relname) + 1) ~ '^_[0-9]{3}$'
+  ),
+  tables as (
+    select p.child_oid,
+           p.child_name,
+           p.parent_name || '_' ||
+             (extract(isoyear from w.bucket)::int)::text ||
+             lpad((extract(week from w.bucket)::int)::text, 2, '0') as new_name
+      from partitions p
+     cross join lateral (
+       select absurd.week_bucket_utc(to_timestamp(
+                ('x' || substr(replace(p.lower_bound::text, '-', ''), 1, 12))::bit(48)::bigint
+                / 1000.0
+              )) at time zone 'UTC' as bucket
+     ) w
+     where p.lower_bound is not null
+  ),
+  renames as (
+    select t.child_name as old_name, t.new_name
+      from tables t
+    union all
+    select ic.relname,
+           t.new_name || substr(ic.relname, length(t.child_name) + 1)
+      from tables t
+      join pg_catalog.pg_index ix on ix.indrelid = t.child_oid
+      join pg_catalog.pg_class ic on ic.oid = ix.indexrelid
+     where left(ic.relname, length(t.child_name) + 1) = t.child_name || '_'
+       and octet_length(t.new_name)
+           + octet_length(ic.relname) - octet_length(t.child_name) <= 63
+  )
+  select string_agg(format('%s -> %s', r.old_name, r.new_name), ', '
+                    order by r.new_name, r.old_name)
+    into v_collisions
+    from renames r
+   where exists (
+           select 1
+             from pg_catalog.pg_class c
+            where c.relnamespace = 'absurd'::regnamespace
+              and c.relname = r.new_name
+         )
+      or (select count(*) from renames d where d.new_name = r.new_name) > 1;
+
+  if v_collisions is not null then
+    raise exception 'Cannot migrate to main: these weekly partition renames collide with an existing relation or each other: %', v_collisions
+      using hint = 'A queue named like a partitioned queue followed by _ and six digits owns the new partition names of that queue.  Drain the queue that owns the existing relation, drop it with absurd.drop_queue() and recreate it under another name, then apply this migration again.  Nothing has been changed.',
+            errcode = 'duplicate_table';
   end if;
 end;
 $$;
@@ -367,7 +455,7 @@ create or replace function absurd.ensure_queue_tables (p_queue_name text)
   language plpgsql
 as $$
 declare
-  v_storage_mode text := 'unpartitioned';
+  v_storage_mode text;
   v_t_suffix text;
   v_r_suffix text;
   v_c_suffix text;
@@ -376,11 +464,28 @@ declare
 begin
   perform absurd.validate_queue_name(p_queue_name);
 
-  select storage_mode into v_storage_mode
-  from absurd.queues
-  where queue_name = p_queue_name;
+  -- Lock the queue's row before any table or index DDL, the order
+  -- drop_queue() takes them in (row, then tables).  Taking table locks first
+  -- (CREATE INDEX IF NOT EXISTS locks an existing table) and the row later, as
+  -- ensure_claim_function() does, deadlocks with a concurrent drop_queue().
+  -- After waiting for a drop, the row is gone and there is nothing to ensure.
+  -- A caller without UPDATE on absurd.queues cannot lock the row; it reads
+  -- the row unlocked and gets no claim function (ensure_claim_function()).
+  begin
+    select q.storage_mode into v_storage_mode
+      from absurd.queues q
+     where q.queue_name = p_queue_name
+       for no key update;
+  exception
+    when insufficient_privilege then
+      select q.storage_mode into v_storage_mode
+        from absurd.queues q
+       where q.queue_name = p_queue_name;
+  end;
 
-  v_storage_mode := coalesce(v_storage_mode, 'unpartitioned');
+  if v_storage_mode is null then
+    return;
+  end if;
 
   if v_storage_mode not in ('unpartitioned', 'partitioned') then
     raise exception 'Unsupported queue storage mode "%"', v_storage_mode;
@@ -880,19 +985,6 @@ begin
       p_queue_name;
   end if;
 
-  -- Extend the claim if requested
-  if p_extend_claim_by is not null and p_extend_claim_by > 0 then
-    execute format(
-      'update absurd.%I
-          set claim_expires_at = $2 + make_interval(secs => $3)
-        where run_id = $1
-          and state = ''running''
-          and claim_expires_at is not null',
-      'r_' || p_queue_name
-    )
-    using p_owner_run, v_now, p_extend_claim_by;
-  end if;
-
   execute format(
     'select c.owner_run_id,
             r.attempt
@@ -918,6 +1010,85 @@ begin
       'c_' || p_queue_name
     ) using p_task_id, p_step_name, p_state, p_owner_run, v_now;
   end if;
+
+  -- Extend the claim if requested, after the checkpoint write: that write can wait behind
+  -- another transaction, and the renewal must count from when the claim is written.
+  if p_extend_claim_by is not null and p_extend_claim_by > 0 then
+    execute format(
+      'update absurd.%I
+          set claim_expires_at = $2 + make_interval(secs => $3)
+        where run_id = $1
+          and state = ''running''
+          and claim_expires_at is not null',
+      'r_' || p_queue_name
+    )
+    using p_owner_run, absurd.current_time(), p_extend_claim_by;
+  end if;
+end;
+$$;
+
+create or replace function absurd.extend_claim (
+  p_queue_name text,
+  p_run_id uuid,
+  p_extend_by integer
+)
+  returns void
+  language plpgsql
+as $$
+declare
+  v_now timestamptz;
+  v_task_state text;
+  v_run_state text;
+  v_claim_expires_at timestamptz;
+begin
+  if p_extend_by is null or p_extend_by <= 0 then
+    raise exception 'extend_by must be > 0';
+  end if;
+
+  execute format(
+    'select r.state,
+            r.claim_expires_at,
+            t.state
+       from absurd.%I r
+       join absurd.%I t on t.task_id = r.task_id
+      where r.run_id = $1
+      for update',
+    'r_' || p_queue_name,
+    't_' || p_queue_name
+  )
+  into v_run_state, v_claim_expires_at, v_task_state
+  using p_run_id;
+
+  if v_run_state is null then
+    raise exception 'Run "%" not found in queue "%"', p_run_id, p_queue_name;
+  end if;
+
+  if v_task_state = 'cancelled' then
+    raise exception sqlstate 'AB001' using message = 'Task has been cancelled';
+  end if;
+
+  if v_run_state <> 'running' then
+    if v_run_state = 'failed' then
+      raise exception sqlstate 'AB002' using message = format('Run "%s" has already failed in queue "%s"', p_run_id, p_queue_name);
+    end if;
+    raise exception 'Run "%" is not currently running in queue "%"', p_run_id, p_queue_name;
+  end if;
+
+  if v_claim_expires_at is null then
+    raise exception 'Run "%" does not have an active claim in queue "%"', p_run_id, p_queue_name;
+  end if;
+
+  -- Renew from when the claim is written: the row lock above can wait behind another
+  -- transaction, and a time read before that wait can renew to an expiry already past.
+  v_now := absurd.current_time();
+
+  execute format(
+    'update absurd.%I
+        set claim_expires_at = $2 + make_interval(secs => $3)
+      where run_id = $1',
+    'r_' || p_queue_name
+  )
+  using p_run_id, v_now, p_extend_by;
 end;
 $$;
 
@@ -1145,14 +1316,21 @@ end;
 $$;
 
 -- Cleans up old completed, failed, or cancelled tasks and their related data.
--- Deletes tasks whose terminal timestamp (completed_at, failed_at, or cancelled_at)
--- is older than the specified TTL in seconds.
+-- Deletes up to p_limit tasks whose terminal timestamp (completed_at,
+-- failed_at, or cancelled_at) is older than the specified TTL in seconds,
+-- oldest first.
 --
 -- Locks are taken runs first, then tasks, the order complete_run(), fail_run(),
 -- extend_claim() and cancel_task() use: taking the task first would deadlock
 -- with an operation that holds one of its runs and waits for the task.  Tasks
 -- with a run or the task row locked by someone else are skipped (left for a
--- later batch), and eligibility is checked again once the task is locked.
+-- later call), and eligibility is checked again once the task is locked.
+--
+-- Skipped tasks do not count against p_limit.  Candidates are read in pages,
+-- in (terminal timestamp, task_id) order and each no larger than the number of
+-- deletions still allowed, until p_limit tasks are deleted or no eligible task
+-- is left, so a locked oldest task does not stall cleanup and concurrent
+-- cleanups move on past each other's tasks.
 --
 -- Returns the number of tasks deleted.
 create or replace function absurd.cleanup_tasks (
@@ -1166,10 +1344,13 @@ as $$
 declare
   v_now timestamptz := absurd.current_time();
   v_cutoff timestamptz;
-  v_deleted_count integer;
+  v_deleted_count integer := 0;
+  v_page_deleted integer;
   v_storage_mode text := 'unpartitioned';
   v_task_ids uuid[];
   v_locked_run_ids uuid[];
+  v_after_terminal_at timestamptz;
+  v_after_task_id uuid;
 begin
   if p_ttl_seconds is null or p_ttl_seconds < 0 then
     raise exception 'TTL must be a non-negative number of seconds';
@@ -1187,133 +1368,133 @@ begin
 
   v_storage_mode := coalesce(v_storage_mode, 'unpartitioned');
 
-  -- 1. The oldest eligible tasks, without locking anything yet.  A task is
-  --    eligible once it is terminal and its terminal timestamp (that of its
-  --    latest run for completed and failed tasks) is older than the cutoff.
-  execute format(
-    'select coalesce(array_agg(task_id), ''{}'')
-       from (
-         select t.task_id
-           from absurd.%1$I t
-           left join absurd.%2$I r on r.run_id = t.last_attempt_run
-          where t.state in (''completed'', ''failed'', ''cancelled'')
-            and case
-                  when t.state = ''completed'' then r.completed_at
-                  when t.state = ''failed'' then r.failed_at
-                  when t.state = ''cancelled'' then t.cancelled_at
-                  else null
-                end < $1
-          order by case
-                     when t.state = ''completed'' then r.completed_at
-                     when t.state = ''failed'' then r.failed_at
-                     when t.state = ''cancelled'' then t.cancelled_at
-                     else null
-                   end
-          limit $2
-       ) e',
-    't_' || p_queue_name,
-    'r_' || p_queue_name
-  )
-  into v_task_ids
-  using v_cutoff, p_limit;
-
-  if cardinality(v_task_ids) = 0 then
-    return 0;
-  end if;
-
-  -- 2. Their runs, skipping runs locked by someone else.  Only tasks whose
-  --    runs are all locked here stay candidates.
-  execute format(
-    'select coalesce(array_agg(run_id), ''{}'')
-       from (
-         select r.run_id
-           from absurd.%1$I r
-          where r.task_id = any($1)
-          order by r.run_id
-            for update skip locked
-       ) l',
-    'r_' || p_queue_name
-  )
-  into v_locked_run_ids
-  using v_task_ids;
-
-  execute format(
-    'select coalesce(array_agg(c.task_id), ''{}'')
-       from unnest($1) as c(task_id)
-      where not exists (
-        select 1
-          from absurd.%1$I r
-         where r.task_id = c.task_id
-           and r.run_id <> all($2)
-      )',
-    'r_' || p_queue_name
-  )
-  into v_task_ids
-  using v_task_ids, v_locked_run_ids;
-
-  if cardinality(v_task_ids) = 0 then
-    return 0;
-  end if;
-
-  -- 3. The tasks themselves, skipping tasks locked by someone else, and
-  --    checking eligibility again now that nothing can change it.
-  execute format(
-    'select coalesce(array_agg(task_id), ''{}'')
-       from (
-         select t.task_id
-           from absurd.%1$I t
-           left join absurd.%2$I r on r.run_id = t.last_attempt_run
-          where t.task_id = any($1)
-            and t.state in (''completed'', ''failed'', ''cancelled'')
-            and case
-                  when t.state = ''completed'' then r.completed_at
-                  when t.state = ''failed'' then r.failed_at
-                  when t.state = ''cancelled'' then t.cancelled_at
-                  else null
-                end < $2
-            for update of t skip locked
-       ) l',
-    't_' || p_queue_name,
-    'r_' || p_queue_name
-  )
-  into v_task_ids
-  using v_task_ids, v_cutoff;
-
-  if cardinality(v_task_ids) = 0 then
-    return 0;
-  end if;
-
-  -- 4. Delete in order: wait registrations, checkpoints, runs, idempotency
-  --    keys (partitioned queues keep them in a side table; unpartitioned
-  --    queues keep them on the task row), then tasks.
-  execute format(
-    'delete from absurd.%I w where w.task_id = any($1)',
-    'w_' || p_queue_name
-  ) using v_task_ids;
-
-  execute format(
-    'delete from absurd.%I c where c.task_id = any($1)',
-    'c_' || p_queue_name
-  ) using v_task_ids;
-
-  execute format(
-    'delete from absurd.%I r where r.task_id = any($1)',
-    'r_' || p_queue_name
-  ) using v_task_ids;
-
-  if v_storage_mode = 'partitioned' then
+  while v_deleted_count < p_limit loop
+    -- 1. The next page of eligible tasks after the last one looked at, without
+    --    locking anything yet.  A task is eligible once it is terminal and its
+    --    terminal timestamp (that of its latest run for completed and failed
+    --    tasks) is older than the cutoff.
     execute format(
-      'delete from absurd.%I i where i.task_id = any($1)',
-      'i_' || p_queue_name
+      'select coalesce(array_agg(e.task_id order by e.terminal_at, e.task_id), ''{}''),
+              (array_agg(e.terminal_at order by e.terminal_at desc, e.task_id desc))[1],
+              (array_agg(e.task_id order by e.terminal_at desc, e.task_id desc))[1]
+         from (
+           select t.task_id, x.terminal_at
+             from absurd.%1$I t
+             left join absurd.%2$I r on r.run_id = t.last_attempt_run
+            cross join lateral (
+              select case
+                       when t.state = ''completed'' then r.completed_at
+                       when t.state = ''failed'' then r.failed_at
+                       when t.state = ''cancelled'' then t.cancelled_at
+                       else null
+                     end as terminal_at
+            ) x
+            where t.state in (''completed'', ''failed'', ''cancelled'')
+              and x.terminal_at < $1
+              and ($3::timestamptz is null
+                   or (x.terminal_at, t.task_id) > ($3::timestamptz, $4::uuid))
+            order by x.terminal_at, t.task_id
+            limit $2
+         ) e',
+      't_' || p_queue_name,
+      'r_' || p_queue_name
+    )
+    into v_task_ids, v_after_terminal_at, v_after_task_id
+    using v_cutoff, p_limit - v_deleted_count, v_after_terminal_at, v_after_task_id;
+
+    exit when cardinality(v_task_ids) = 0;
+
+    -- 2. Their runs, skipping runs locked by someone else.  Only tasks whose
+    --    runs are all locked here stay candidates.
+    execute format(
+      'select coalesce(array_agg(run_id), ''{}'')
+         from (
+           select r.run_id
+             from absurd.%1$I r
+            where r.task_id = any($1)
+            order by r.run_id
+              for update skip locked
+         ) l',
+      'r_' || p_queue_name
+    )
+    into v_locked_run_ids
+    using v_task_ids;
+
+    execute format(
+      'select coalesce(array_agg(c.task_id), ''{}'')
+         from unnest($1) as c(task_id)
+        where not exists (
+          select 1
+            from absurd.%1$I r
+           where r.task_id = c.task_id
+             and r.run_id <> all($2)
+        )',
+      'r_' || p_queue_name
+    )
+    into v_task_ids
+    using v_task_ids, v_locked_run_ids;
+
+    continue when cardinality(v_task_ids) = 0;
+
+    -- 3. The tasks themselves, skipping tasks locked by someone else, and
+    --    checking eligibility again now that nothing can change it.
+    execute format(
+      'select coalesce(array_agg(task_id), ''{}'')
+         from (
+           select t.task_id
+             from absurd.%1$I t
+             left join absurd.%2$I r on r.run_id = t.last_attempt_run
+            where t.task_id = any($1)
+              and t.state in (''completed'', ''failed'', ''cancelled'')
+              and case
+                    when t.state = ''completed'' then r.completed_at
+                    when t.state = ''failed'' then r.failed_at
+                    when t.state = ''cancelled'' then t.cancelled_at
+                    else null
+                  end < $2
+              for update of t skip locked
+         ) l',
+      't_' || p_queue_name,
+      'r_' || p_queue_name
+    )
+    into v_task_ids
+    using v_task_ids, v_cutoff;
+
+    continue when cardinality(v_task_ids) = 0;
+
+    -- 4. Delete in order: wait registrations, checkpoints, runs, idempotency
+    --    keys (partitioned queues keep them in a side table; unpartitioned
+    --    queues keep them on the task row), then tasks.
+    execute format(
+      'delete from absurd.%I w where w.task_id = any($1)',
+      'w_' || p_queue_name
     ) using v_task_ids;
-  end if;
 
-  execute format(
-    'delete from absurd.%I t where t.task_id = any($1)',
-    't_' || p_queue_name
-  ) using v_task_ids;
+    execute format(
+      'delete from absurd.%I c where c.task_id = any($1)',
+      'c_' || p_queue_name
+    ) using v_task_ids;
 
-  get diagnostics v_deleted_count = row_count;
+    execute format(
+      'delete from absurd.%I r where r.task_id = any($1)',
+      'r_' || p_queue_name
+    ) using v_task_ids;
+
+    if v_storage_mode = 'partitioned' then
+      execute format(
+        'delete from absurd.%I i where i.task_id = any($1)',
+        'i_' || p_queue_name
+      ) using v_task_ids;
+    end if;
+
+    execute format(
+      'delete from absurd.%I t where t.task_id = any($1)',
+      't_' || p_queue_name
+    ) using v_task_ids;
+
+    get diagnostics v_page_deleted = row_count;
+    v_deleted_count := v_deleted_count + v_page_deleted;
+  end loop;
 
   return v_deleted_count;
 end;

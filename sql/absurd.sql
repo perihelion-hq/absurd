@@ -468,7 +468,7 @@ create function absurd.ensure_queue_tables (p_queue_name text)
   language plpgsql
 as $$
 declare
-  v_storage_mode text := 'unpartitioned';
+  v_storage_mode text;
   v_t_suffix text;
   v_r_suffix text;
   v_c_suffix text;
@@ -477,11 +477,28 @@ declare
 begin
   perform absurd.validate_queue_name(p_queue_name);
 
-  select storage_mode into v_storage_mode
-  from absurd.queues
-  where queue_name = p_queue_name;
+  -- Lock the queue's row before any table or index DDL, the order
+  -- drop_queue() takes them in (row, then tables).  Taking table locks first
+  -- (CREATE INDEX IF NOT EXISTS locks an existing table) and the row later, as
+  -- ensure_claim_function() does, deadlocks with a concurrent drop_queue().
+  -- After waiting for a drop, the row is gone and there is nothing to ensure.
+  -- A caller without UPDATE on absurd.queues cannot lock the row; it reads
+  -- the row unlocked and gets no claim function (ensure_claim_function()).
+  begin
+    select q.storage_mode into v_storage_mode
+      from absurd.queues q
+     where q.queue_name = p_queue_name
+       for no key update;
+  exception
+    when insufficient_privilege then
+      select q.storage_mode into v_storage_mode
+        from absurd.queues q
+       where q.queue_name = p_queue_name;
+  end;
 
-  v_storage_mode := coalesce(v_storage_mode, 'unpartitioned');
+  if v_storage_mode is null then
+    return;
+  end if;
 
   if v_storage_mode not in ('unpartitioned', 'partitioned') then
     raise exception 'Unsupported queue storage mode "%"', v_storage_mode;
@@ -2507,14 +2524,21 @@ end;
 $$;
 
 -- Cleans up old completed, failed, or cancelled tasks and their related data.
--- Deletes tasks whose terminal timestamp (completed_at, failed_at, or cancelled_at)
--- is older than the specified TTL in seconds.
+-- Deletes up to p_limit tasks whose terminal timestamp (completed_at,
+-- failed_at, or cancelled_at) is older than the specified TTL in seconds,
+-- oldest first.
 --
 -- Locks are taken runs first, then tasks, the order complete_run(), fail_run(),
 -- extend_claim() and cancel_task() use: taking the task first would deadlock
 -- with an operation that holds one of its runs and waits for the task.  Tasks
 -- with a run or the task row locked by someone else are skipped (left for a
--- later batch), and eligibility is checked again once the task is locked.
+-- later call), and eligibility is checked again once the task is locked.
+--
+-- Skipped tasks do not count against p_limit.  Candidates are read in pages,
+-- in (terminal timestamp, task_id) order and each no larger than the number of
+-- deletions still allowed, until p_limit tasks are deleted or no eligible task
+-- is left, so a locked oldest task does not stall cleanup and concurrent
+-- cleanups move on past each other's tasks.
 --
 -- Returns the number of tasks deleted.
 create function absurd.cleanup_tasks (
@@ -2528,10 +2552,13 @@ as $$
 declare
   v_now timestamptz := absurd.current_time();
   v_cutoff timestamptz;
-  v_deleted_count integer;
+  v_deleted_count integer := 0;
+  v_page_deleted integer;
   v_storage_mode text := 'unpartitioned';
   v_task_ids uuid[];
   v_locked_run_ids uuid[];
+  v_after_terminal_at timestamptz;
+  v_after_task_id uuid;
 begin
   if p_ttl_seconds is null or p_ttl_seconds < 0 then
     raise exception 'TTL must be a non-negative number of seconds';
@@ -2549,133 +2576,133 @@ begin
 
   v_storage_mode := coalesce(v_storage_mode, 'unpartitioned');
 
-  -- 1. The oldest eligible tasks, without locking anything yet.  A task is
-  --    eligible once it is terminal and its terminal timestamp (that of its
-  --    latest run for completed and failed tasks) is older than the cutoff.
-  execute format(
-    'select coalesce(array_agg(task_id), ''{}'')
-       from (
-         select t.task_id
-           from absurd.%1$I t
-           left join absurd.%2$I r on r.run_id = t.last_attempt_run
-          where t.state in (''completed'', ''failed'', ''cancelled'')
-            and case
-                  when t.state = ''completed'' then r.completed_at
-                  when t.state = ''failed'' then r.failed_at
-                  when t.state = ''cancelled'' then t.cancelled_at
-                  else null
-                end < $1
-          order by case
-                     when t.state = ''completed'' then r.completed_at
-                     when t.state = ''failed'' then r.failed_at
-                     when t.state = ''cancelled'' then t.cancelled_at
-                     else null
-                   end
-          limit $2
-       ) e',
-    't_' || p_queue_name,
-    'r_' || p_queue_name
-  )
-  into v_task_ids
-  using v_cutoff, p_limit;
-
-  if cardinality(v_task_ids) = 0 then
-    return 0;
-  end if;
-
-  -- 2. Their runs, skipping runs locked by someone else.  Only tasks whose
-  --    runs are all locked here stay candidates.
-  execute format(
-    'select coalesce(array_agg(run_id), ''{}'')
-       from (
-         select r.run_id
-           from absurd.%1$I r
-          where r.task_id = any($1)
-          order by r.run_id
-            for update skip locked
-       ) l',
-    'r_' || p_queue_name
-  )
-  into v_locked_run_ids
-  using v_task_ids;
-
-  execute format(
-    'select coalesce(array_agg(c.task_id), ''{}'')
-       from unnest($1) as c(task_id)
-      where not exists (
-        select 1
-          from absurd.%1$I r
-         where r.task_id = c.task_id
-           and r.run_id <> all($2)
-      )',
-    'r_' || p_queue_name
-  )
-  into v_task_ids
-  using v_task_ids, v_locked_run_ids;
-
-  if cardinality(v_task_ids) = 0 then
-    return 0;
-  end if;
-
-  -- 3. The tasks themselves, skipping tasks locked by someone else, and
-  --    checking eligibility again now that nothing can change it.
-  execute format(
-    'select coalesce(array_agg(task_id), ''{}'')
-       from (
-         select t.task_id
-           from absurd.%1$I t
-           left join absurd.%2$I r on r.run_id = t.last_attempt_run
-          where t.task_id = any($1)
-            and t.state in (''completed'', ''failed'', ''cancelled'')
-            and case
-                  when t.state = ''completed'' then r.completed_at
-                  when t.state = ''failed'' then r.failed_at
-                  when t.state = ''cancelled'' then t.cancelled_at
-                  else null
-                end < $2
-            for update of t skip locked
-       ) l',
-    't_' || p_queue_name,
-    'r_' || p_queue_name
-  )
-  into v_task_ids
-  using v_task_ids, v_cutoff;
-
-  if cardinality(v_task_ids) = 0 then
-    return 0;
-  end if;
-
-  -- 4. Delete in order: wait registrations, checkpoints, runs, idempotency
-  --    keys (partitioned queues keep them in a side table; unpartitioned
-  --    queues keep them on the task row), then tasks.
-  execute format(
-    'delete from absurd.%I w where w.task_id = any($1)',
-    'w_' || p_queue_name
-  ) using v_task_ids;
-
-  execute format(
-    'delete from absurd.%I c where c.task_id = any($1)',
-    'c_' || p_queue_name
-  ) using v_task_ids;
-
-  execute format(
-    'delete from absurd.%I r where r.task_id = any($1)',
-    'r_' || p_queue_name
-  ) using v_task_ids;
-
-  if v_storage_mode = 'partitioned' then
+  while v_deleted_count < p_limit loop
+    -- 1. The next page of eligible tasks after the last one looked at, without
+    --    locking anything yet.  A task is eligible once it is terminal and its
+    --    terminal timestamp (that of its latest run for completed and failed
+    --    tasks) is older than the cutoff.
     execute format(
-      'delete from absurd.%I i where i.task_id = any($1)',
-      'i_' || p_queue_name
+      'select coalesce(array_agg(e.task_id order by e.terminal_at, e.task_id), ''{}''),
+              (array_agg(e.terminal_at order by e.terminal_at desc, e.task_id desc))[1],
+              (array_agg(e.task_id order by e.terminal_at desc, e.task_id desc))[1]
+         from (
+           select t.task_id, x.terminal_at
+             from absurd.%1$I t
+             left join absurd.%2$I r on r.run_id = t.last_attempt_run
+            cross join lateral (
+              select case
+                       when t.state = ''completed'' then r.completed_at
+                       when t.state = ''failed'' then r.failed_at
+                       when t.state = ''cancelled'' then t.cancelled_at
+                       else null
+                     end as terminal_at
+            ) x
+            where t.state in (''completed'', ''failed'', ''cancelled'')
+              and x.terminal_at < $1
+              and ($3::timestamptz is null
+                   or (x.terminal_at, t.task_id) > ($3::timestamptz, $4::uuid))
+            order by x.terminal_at, t.task_id
+            limit $2
+         ) e',
+      't_' || p_queue_name,
+      'r_' || p_queue_name
+    )
+    into v_task_ids, v_after_terminal_at, v_after_task_id
+    using v_cutoff, p_limit - v_deleted_count, v_after_terminal_at, v_after_task_id;
+
+    exit when cardinality(v_task_ids) = 0;
+
+    -- 2. Their runs, skipping runs locked by someone else.  Only tasks whose
+    --    runs are all locked here stay candidates.
+    execute format(
+      'select coalesce(array_agg(run_id), ''{}'')
+         from (
+           select r.run_id
+             from absurd.%1$I r
+            where r.task_id = any($1)
+            order by r.run_id
+              for update skip locked
+         ) l',
+      'r_' || p_queue_name
+    )
+    into v_locked_run_ids
+    using v_task_ids;
+
+    execute format(
+      'select coalesce(array_agg(c.task_id), ''{}'')
+         from unnest($1) as c(task_id)
+        where not exists (
+          select 1
+            from absurd.%1$I r
+           where r.task_id = c.task_id
+             and r.run_id <> all($2)
+        )',
+      'r_' || p_queue_name
+    )
+    into v_task_ids
+    using v_task_ids, v_locked_run_ids;
+
+    continue when cardinality(v_task_ids) = 0;
+
+    -- 3. The tasks themselves, skipping tasks locked by someone else, and
+    --    checking eligibility again now that nothing can change it.
+    execute format(
+      'select coalesce(array_agg(task_id), ''{}'')
+         from (
+           select t.task_id
+             from absurd.%1$I t
+             left join absurd.%2$I r on r.run_id = t.last_attempt_run
+            where t.task_id = any($1)
+              and t.state in (''completed'', ''failed'', ''cancelled'')
+              and case
+                    when t.state = ''completed'' then r.completed_at
+                    when t.state = ''failed'' then r.failed_at
+                    when t.state = ''cancelled'' then t.cancelled_at
+                    else null
+                  end < $2
+              for update of t skip locked
+         ) l',
+      't_' || p_queue_name,
+      'r_' || p_queue_name
+    )
+    into v_task_ids
+    using v_task_ids, v_cutoff;
+
+    continue when cardinality(v_task_ids) = 0;
+
+    -- 4. Delete in order: wait registrations, checkpoints, runs, idempotency
+    --    keys (partitioned queues keep them in a side table; unpartitioned
+    --    queues keep them on the task row), then tasks.
+    execute format(
+      'delete from absurd.%I w where w.task_id = any($1)',
+      'w_' || p_queue_name
     ) using v_task_ids;
-  end if;
 
-  execute format(
-    'delete from absurd.%I t where t.task_id = any($1)',
-    't_' || p_queue_name
-  ) using v_task_ids;
+    execute format(
+      'delete from absurd.%I c where c.task_id = any($1)',
+      'c_' || p_queue_name
+    ) using v_task_ids;
 
-  get diagnostics v_deleted_count = row_count;
+    execute format(
+      'delete from absurd.%I r where r.task_id = any($1)',
+      'r_' || p_queue_name
+    ) using v_task_ids;
+
+    if v_storage_mode = 'partitioned' then
+      execute format(
+        'delete from absurd.%I i where i.task_id = any($1)',
+        'i_' || p_queue_name
+      ) using v_task_ids;
+    end if;
+
+    execute format(
+      'delete from absurd.%I t where t.task_id = any($1)',
+      't_' || p_queue_name
+    ) using v_task_ids;
+
+    get diagnostics v_page_deleted = row_count;
+    v_deleted_count := v_deleted_count + v_page_deleted;
+  end loop;
 
   return v_deleted_count;
 end;
