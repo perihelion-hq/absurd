@@ -1323,7 +1323,7 @@ $$;
 -- Cleans up old completed, failed, or cancelled tasks and their related data.
 -- Deletes up to p_limit tasks whose terminal timestamp (completed_at,
 -- failed_at, or cancelled_at) is older than the specified TTL in seconds,
--- oldest first.
+-- in task_id order.
 --
 -- Locks are taken runs first, then tasks, the order complete_run(), fail_run(),
 -- extend_claim() and cancel_task() use: taking the task first would deadlock
@@ -1332,16 +1332,23 @@ $$;
 -- later call), and eligibility is checked again once the task is locked.
 --
 -- Skipped tasks do not count against p_limit.  Candidates are read in pages
--- in (terminal timestamp, task_id) order, until p_limit tasks are deleted or
--- no eligible task is left, so a locked oldest task does not stall cleanup and
--- concurrent cleanups move on past each other's tasks.  The terminal timestamp
--- has no index, so every page scans the eligible backlog and keeps only its
--- page in a top-N sort.  The first page holds p_limit tasks, as one batch did
--- before; a page after one that skipped tasks is twice as large (and never
--- smaller than the deletions still allowed), so skipping K locked tasks costs
--- about log2(K) scans instead of one scan per skipped task, and no page sorts
--- more than about twice the tasks examined.  Locks taken for a task that is
--- then skipped or left over are released again (see step 2 and 3 below).
+-- in task_id order (roughly creation order for the UUIDv7 IDs spawn_task
+-- generates, not terminal-time order), until p_limit tasks
+-- are deleted or no eligible task is left, so a locked first task does not
+-- stall cleanup and concurrent cleanups move on past each other's tasks.  Each
+-- page continues the primary-key index walk after the last task_id the
+-- previous page looked at, so moving past K locked tasks reads them once
+-- instead of joining, filtering and sorting the queue's history again for
+-- every page (the terminal timestamp spans the task and run tables and has no
+-- index to seek on).  Pages are capped at 1000 tasks, whatever p_limit or the
+-- number of locked tasks: a page's candidates are held in arrays and their
+-- runs are locked before locked tasks are rejected.  Below that cap, the first
+-- page holds p_limit tasks and each later page is twice as large as the one
+-- before (and no smaller than the deletions still allowed), so moving past
+-- locked tasks takes few statements; at the cap, a page can be smaller than
+-- the deletions still allowed, and further pages follow.  Locks taken for a
+-- task that is then skipped or left over are released again (see step 2 and 3
+-- below).
 --
 -- Returns the number of tasks deleted.
 create or replace function absurd.cleanup_tasks (
@@ -1361,9 +1368,9 @@ declare
   v_task_ids uuid[];
   v_locked_run_ids uuid[];
   v_accepted_ids uuid[];
-  v_after_terminal_at timestamptz;
   v_after_task_id uuid;
-  v_page_size bigint := p_limit;
+  v_max_page_size constant integer := 1000;
+  v_page_size integer;
 begin
   if p_ttl_seconds is null or p_ttl_seconds < 0 then
     raise exception 'TTL must be a non-negative number of seconds';
@@ -1380,51 +1387,53 @@ begin
   where queue_name = p_queue_name;
 
   v_storage_mode := coalesce(v_storage_mode, 'unpartitioned');
+  v_page_size := least(p_limit, v_max_page_size);
 
   while v_deleted_count < p_limit loop
     if v_after_task_id is not null then
-      v_page_size := greatest(v_page_size * 2, p_limit - v_deleted_count);
+      v_page_size := least(
+        greatest(v_page_size * 2, p_limit - v_deleted_count),
+        v_max_page_size
+      );
     end if;
 
-    -- 1. The next page of eligible tasks after the last one looked at, without
-    --    locking anything yet.  A task is eligible once it is terminal and its
-    --    terminal timestamp (that of its latest run for completed and failed
-    --    tasks) is older than the cutoff.
+    -- 1. The next page of eligible tasks after the last one looked at, in
+    --    task_id order, without locking anything yet.  A task is eligible
+    --    once it is terminal and its terminal timestamp (that of its latest
+    --    run for completed and failed tasks) is older than the cutoff.
+    --    task_id is the primary key, so each page continues the index walk
+    --    where the previous one stopped instead of joining, filtering and
+    --    sorting the queue's history again.
     execute format(
-      'select coalesce(array_agg(e.task_id order by e.terminal_at, e.task_id), ''{}''),
-              (array_agg(e.terminal_at order by e.terminal_at desc, e.task_id desc))[1],
-              (array_agg(e.task_id order by e.terminal_at desc, e.task_id desc))[1]
+      'select coalesce(array_agg(e.task_id order by e.task_id), ''{}''),
+              (array_agg(e.task_id order by e.task_id desc))[1]
          from (
-           select t.task_id, x.terminal_at
+           select t.task_id
              from absurd.%1$I t
              left join absurd.%2$I r on r.run_id = t.last_attempt_run
-            cross join lateral (
-              select case
-                       when t.state = ''completed'' then r.completed_at
-                       when t.state = ''failed'' then r.failed_at
-                       when t.state = ''cancelled'' then t.cancelled_at
-                       else null
-                     end as terminal_at
-            ) x
             where t.state in (''completed'', ''failed'', ''cancelled'')
-              and x.terminal_at < $1
-              and ($3::timestamptz is null
-                   or (x.terminal_at, t.task_id) > ($3::timestamptz, $4::uuid))
-            order by x.terminal_at, t.task_id
+              and case
+                    when t.state = ''completed'' then r.completed_at
+                    when t.state = ''failed'' then r.failed_at
+                    when t.state = ''cancelled'' then t.cancelled_at
+                    else null
+                  end < $1
+              and ($3::uuid is null or t.task_id > $3::uuid)
+            order by t.task_id
             limit $2
          ) e',
       't_' || p_queue_name,
       'r_' || p_queue_name
     )
-    into v_task_ids, v_after_terminal_at, v_after_task_id
-    using v_cutoff, v_page_size, v_after_terminal_at, v_after_task_id;
+    into v_task_ids, v_after_task_id
+    using v_cutoff, v_page_size, v_after_task_id;
 
     exit when cardinality(v_task_ids) = 0;
 
     -- 2. and 3. Lock the candidates' runs, then the candidates, skipping
     --    what someone else holds.  A candidate is accepted when all its runs
     --    and the task itself are locked here and the task is still eligible,
-    --    oldest first and no more than the deletions still allowed.  The
+    --    in task_id order and no more than the deletions still allowed.  The
     --    locks are taken in a subtransaction, which is rolled back (releasing
     --    every lock it took) unless all candidates were accepted; the accepted
     --    ones are then locked again on their own.  So only tasks about to be
