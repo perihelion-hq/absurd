@@ -4,6 +4,8 @@ This contains the changes between releases.
 
 # Unreleased
 
+* Improved `absurd.claim_task()` polling cost: each queue now gets a generated `absurd.ct_<queue>` function holding the claim statements as static SQL, so PostgreSQL caches their plans instead of re-planning dynamic SQL on every poll.  `claim_task()` keeps its signature and semantics and falls back to its previous dynamic statements for queues without a generated function.  The `0.5.0-main` migration creates the functions for existing queues.
+
 # 0.5.0
 
 * Added a Habitat tasks filter for terminal failures and defaulted the failed status view to hide failed attempts that were retried later.

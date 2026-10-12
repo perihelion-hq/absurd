@@ -181,6 +181,192 @@ begin
 end;
 $$;
 
+-- Creates (or replaces) the per-queue claim function absurd.ct_<queue>.
+--
+-- claim_task() used to run its three statements through EXECUTE, which
+-- parses and plans them on every call (dynamic SQL is never cached).  Workers
+-- poll claim_task constantly and most polls find nothing, so planning
+-- dominated the cost.  The generated function has the same statements as
+-- static SQL against this queue's tables, so PL/pgSQL caches the plans per
+-- session.  absurd.claim_task() dispatches to it.
+--
+-- The function is SECURITY INVOKER like every other Absurd function and takes
+-- the same arguments as claim_task() except the queue name, which is baked in
+-- so it cannot be pointed at another queue.  Names that would not fit into a
+-- 63-byte identifier (possible only for queues created under older, longer
+-- naming limits) get no function and keep using claim_task()'s dynamic path.
+create function absurd.ensure_claim_function (p_queue_name text)
+  returns void
+  language plpgsql
+as $$
+declare
+  v_fn_name text := 'ct_' || p_queue_name;
+begin
+  if octet_length(v_fn_name) > 63 then
+    return;
+  end if;
+
+  execute format(
+    $tmpl$
+create or replace function absurd.%4$I (
+  p_worker_id text,
+  p_claim_timeout integer default 30,
+  p_qty integer default 1
+)
+  returns table (
+    run_id uuid,
+    task_id uuid,
+    attempt integer,
+    task_name text,
+    params jsonb,
+    retry_strategy jsonb,
+    max_attempts integer,
+    headers jsonb,
+    wake_event text,
+    event_payload jsonb
+  )
+  language plpgsql
+as $fn$
+#variable_conflict use_column
+declare
+  v_queue_name constant text := %5$L;
+  v_now timestamptz := absurd.current_time();
+  v_claim_timeout integer := greatest(coalesce(p_claim_timeout, 30), 0);
+  v_worker_id text := coalesce(nullif(p_worker_id, ''), 'worker');
+  v_qty integer := greatest(coalesce(p_qty, 1), 1);
+  v_claim_until timestamptz := null;
+  v_expired_run record;
+  v_cancel_candidate record;
+  v_expired_sweep_limit integer;
+begin
+  if v_claim_timeout > 0 then
+    v_claim_until := v_now + make_interval(secs => v_claim_timeout);
+  end if;
+
+  -- Keep claim polling work bounded: process at most v_qty expired leases
+  -- per claim call.
+  v_expired_sweep_limit := greatest(v_qty, 1);
+
+  -- Apply cancellation rules before claiming.
+  --
+  -- Use cancel_task() so lock order stays consistent (runs first, task second)
+  -- with complete_run()/fail_run().
+  for v_cancel_candidate in
+    select t.task_id
+      from absurd.%2$I t
+     where t.state in ('pending', 'sleeping', 'running')
+       and (
+         (
+           (t.cancellation->>'max_delay')::bigint is not null
+           and t.first_started_at is null
+           and extract(epoch from (v_now - t.enqueue_at)) >= (t.cancellation->>'max_delay')::bigint
+         )
+         or
+         (
+           (t.cancellation->>'max_duration')::bigint is not null
+           and t.first_started_at is not null
+           and extract(epoch from (v_now - t.first_started_at)) >= (t.cancellation->>'max_duration')::bigint
+         )
+       )
+     order by t.task_id
+  loop
+    perform absurd.cancel_task(v_queue_name, v_cancel_candidate.task_id);
+  end loop;
+
+  for v_expired_run in
+    select r.run_id,
+           r.claimed_by,
+           r.claim_expires_at,
+           r.attempt
+      from absurd.%1$I r
+     where r.state = 'running'
+       and r.claim_expires_at is not null
+       and r.claim_expires_at <= v_now
+     order by r.claim_expires_at, r.run_id
+     limit v_expired_sweep_limit
+       for update skip locked
+  loop
+    perform absurd.fail_run(
+      v_queue_name,
+      v_expired_run.run_id,
+      jsonb_strip_nulls(jsonb_build_object(
+        'name', '$ClaimTimeout',
+        'message', 'worker did not finish task within claim interval',
+        'workerId', v_expired_run.claimed_by,
+        'claimExpiredAt', v_expired_run.claim_expires_at,
+        'attempt', v_expired_run.attempt
+      )),
+      null
+    );
+  end loop;
+
+  return query
+  with candidate as (
+    select r.run_id
+      from absurd.%1$I r
+      join absurd.%2$I t on t.task_id = r.task_id
+     where r.state in ('pending', 'sleeping')
+       and t.state in ('pending', 'sleeping', 'running')
+       and r.available_at <= v_now
+     order by r.available_at, r.run_id
+     limit v_qty
+       for update skip locked
+  ),
+  updated as (
+    update absurd.%1$I r
+       set state = 'running',
+           claimed_by = v_worker_id,
+           claim_expires_at = v_claim_until,
+           started_at = v_now,
+           available_at = v_now
+     where r.run_id in (select c.run_id from candidate c)
+    returning r.run_id, r.task_id, r.attempt
+  ),
+  task_upd as (
+    update absurd.%2$I t
+       set state = 'running',
+           attempts = greatest(t.attempts, u.attempt),
+           first_started_at = coalesce(t.first_started_at, v_now),
+           last_attempt_run = u.run_id
+      from updated u
+     where t.task_id = u.task_id
+    returning t.task_id
+  ),
+  wait_cleanup as (
+    delete from absurd.%3$I w
+     using updated u
+    where w.run_id = u.run_id
+      and w.timeout_at is not null
+      and w.timeout_at <= v_now
+    returning w.run_id
+  )
+  select
+    u.run_id,
+    u.task_id,
+    u.attempt,
+    t.task_name,
+    t.params,
+    t.retry_strategy,
+    t.max_attempts,
+    t.headers,
+    r.wake_event,
+    r.event_payload
+  from updated u
+  join absurd.%1$I r on r.run_id = u.run_id
+  join absurd.%2$I t on t.task_id = u.task_id
+  order by r.available_at, u.run_id;
+end;
+$fn$;
+    $tmpl$,
+    'r_' || p_queue_name,
+    't_' || p_queue_name,
+    'w_' || p_queue_name,
+    v_fn_name,
+    p_queue_name
+  );
+end;
+$$;
+
 create function absurd.ensure_queue_tables (p_queue_name text)
   returns void
   language plpgsql
@@ -358,6 +544,8 @@ begin
 
     perform absurd.ensure_partitions(p_queue_name);
   end if;
+
+  perform absurd.ensure_claim_function(p_queue_name);
 end;
 $$;
 
@@ -439,6 +627,15 @@ begin
       and p.proname = 'unschedule'
   ) then
     perform absurd.disable_cron(p_queue_name);
+  end if;
+
+  -- Per-queue claim function (see ensure_claim_function).  Skipped when the
+  -- name would be truncated so we never drop another queue's function.
+  if octet_length('ct_' || p_queue_name) <= 63 then
+    execute format(
+      'drop function if exists absurd.%I(text, integer, integer)',
+      'ct_' || p_queue_name
+    );
   end if;
 
   execute format('drop table if exists absurd.%I cascade', 'i_' || p_queue_name);
@@ -905,6 +1102,10 @@ $$;
 
 -- Workers call this to reserve a task from a given queue
 -- for a given reservation period in seconds.
+--
+-- The work is done by the per-queue function absurd.ct_<queue> when it
+-- exists (cached plans); the dynamic statements below are the fallback and
+-- must stay semantically identical to the generated ones.
 create function absurd.claim_task (
   p_queue_name text,
   p_worker_id text,
@@ -935,7 +1136,23 @@ declare
   v_expired_run record;
   v_cancel_candidate record;
   v_expired_sweep_limit integer;
+  v_fn_name text := 'ct_' || p_queue_name;
 begin
+  -- Prefer the per-queue function created by ensure_claim_function(): its
+  -- statements are static SQL, so their plans are cached.  Queues without one
+  -- (created before it existed and not yet migrated, or with an over-long
+  -- legacy name) use the dynamic statements below.
+  if exists (
+    select 1
+      from pg_catalog.pg_proc p
+     where p.proname = v_fn_name
+       and p.pronamespace = 'absurd'::regnamespace
+  ) then
+    return query execute format('select * from absurd.%I($1, $2, $3)', v_fn_name)
+      using p_worker_id, p_claim_timeout, p_qty;
+    return;
+  end if;
+
   if v_claim_timeout > 0 then
     v_claim_until := v_now + make_interval(secs => v_claim_timeout);
   end if;
