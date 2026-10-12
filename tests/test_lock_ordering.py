@@ -553,20 +553,22 @@ def test_cleanup_tasks_bounds_its_pages_behind_a_long_locked_prefix(db_dsn):
 def test_cleanup_tasks_takes_eligible_tasks_in_task_id_order(db_dsn, storage_mode):
     """Cleanup walks task_id order, not terminal-time order.
 
-    The task created first but finished last is still the first one deleted,
+    The task first in task_id order but finished last is still deleted first,
     and a task that is terminal but younger than the TTL is never deleted.
     """
     queue = f"cleanup_order_{storage_mode[0]}"
     with psycopg.connect(db_dsn, autocommit=True) as conn:
         conn.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
         try:
-            first, second, recent = [
+            # Spawns within one millisecond need not get increasing UUIDv7s, so
+            # the roles follow task_id order, not spawn order.
+            first, second, recent = sorted(
                 conn.execute(
                     "select task_id, run_id from absurd.spawn_task(%s, %s, '{}')",
                     (queue, name),
                 ).fetchone()
-                for name in ("first", "second", "recent")
-            ]
+                for name in ("a", "b", "c")
+            )
             for (task_id, run_id), age in (
                 (first, "1 hour"),
                 (second, "2 hours"),

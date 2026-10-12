@@ -1334,7 +1334,7 @@ $$;
 -- Skipped tasks do not count against p_limit.  Candidates are read in pages
 -- in task_id order (roughly creation order for the UUIDv7 IDs spawn_task
 -- generates, not terminal-time order), until p_limit tasks
--- are deleted or no eligible task is left, so a locked oldest task does not
+-- are deleted or no eligible task is left, so a locked first task does not
 -- stall cleanup and concurrent cleanups move on past each other's tasks.  Each
 -- page continues the primary-key index walk after the last task_id the
 -- previous page looked at, so moving past K locked tasks reads them once
@@ -1433,7 +1433,7 @@ begin
     -- 2. and 3. Lock the candidates' runs, then the candidates, skipping
     --    what someone else holds.  A candidate is accepted when all its runs
     --    and the task itself are locked here and the task is still eligible,
-    --    oldest first and no more than the deletions still allowed.  The
+    --    in task_id order and no more than the deletions still allowed.  The
     --    locks are taken in a subtransaction, which is rolled back (releasing
     --    every lock it took) unless all candidates were accepted; the accepted
     --    ones are then locked again on their own.  So only tasks about to be
