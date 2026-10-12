@@ -1336,14 +1336,15 @@ $$;
 -- no eligible task is left, so a locked oldest task does not stall cleanup and
 -- concurrent cleanups move on past each other's tasks.  The terminal timestamp
 -- has no index, so every page scans the eligible backlog and keeps only its
--- page in a top-N sort.  The first page holds p_limit tasks, as one batch did
--- before; each later page is twice as large as the one before (and never
--- smaller than the deletions still allowed), so skipping K locked tasks takes
--- far fewer scans than one per skipped task.  No page holds more than 1000
--- tasks, whatever p_limit or the number of locked tasks: a page's candidates
--- are held in arrays and their runs are locked before locked tasks are
--- rejected, so a long locked prefix with an unbounded page would make a small
--- cleanup hold and lock backlog-sized batches.  Locks taken for a task that is
+-- page in a top-N sort.  Pages are capped at 1000 tasks, whatever p_limit or
+-- the number of locked tasks: a page's candidates are held in arrays and their
+-- runs are locked before locked tasks are rejected, so an unbounded page behind
+-- a long locked prefix would make a small cleanup hold and lock backlog-sized
+-- batches.  Below that cap, the first page holds p_limit tasks and each later
+-- page is twice as large as the one before (and no smaller than the deletions
+-- still allowed), so skipping K locked tasks takes far fewer scans than one per
+-- skipped task; at the cap, a page can be smaller than the deletions still
+-- allowed, and further pages follow.  Locks taken for a task that is
 -- then skipped or left over are released again (see step 2 and 3 below).
 --
 -- Returns the number of tasks deleted.
