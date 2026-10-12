@@ -34,6 +34,11 @@ function (a queue not yet migrated), when the calling role lacks `EXECUTE` on
 it, or when its owner is not the owner of the queue's tables.  Installations
 that withhold `PUBLIC` `EXECUTE` and grant it to workers per function need to
 also grant it on `ct_<queue>(text, integer, integer)` to get the cached plans.
+Likewise, `create_queue` generates the function only for a role that may
+execute `absurd.ensure_claim_function(text)` and update `absurd.queues` (it
+locks the queue's row to serialize concurrent generation); otherwise the queue
+is created without it.  `drop_queue` leaves a `ct_<queue>` owned by a role the
+caller cannot act as to that role.
 
 ### Trust boundary of `ct_<queue>`
 
@@ -270,9 +275,9 @@ For lower-volume queues, keep `unpartitioned` and only configure cleanup.
 ## Notes and Caveats
 
 - Partitioning is currently based on UUIDv7 time ranges and weekly buckets.
-- Weekly partition names use `<YWW>` where `Y` is one ISO year digit, so names
-  roll over every 10 years; practical retention must stay below that horizon to
-  avoid partition name collisions.
+- Weekly partition names use `<IYYYIW>` (four-digit ISO year and two-digit ISO
+  week), so they do not repeat across years and retention is not limited by
+  partition naming.
 - `default_partition=enabled` keeps `_d` partitions as a safety net for rows
   outside pre-created weekly windows.
 - `default_partition=disabled` removes attached `_d` partitions (if empty) and

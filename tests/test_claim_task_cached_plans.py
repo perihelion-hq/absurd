@@ -8,6 +8,7 @@ dropped, as for a queue created before the function existed).  All must produce
 the same observable result.
 """
 
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -1152,3 +1153,392 @@ def claim_fn_exists_conn(conn, queue):
         "and pronamespace = 'absurd'::regnamespace",
         (f"ct_{queue}",),
     ).fetchone() == (1,)
+
+
+# -- concurrent regeneration ---------------------------------------------------
+
+
+def _start(conn, statement, params):
+    """Run statement on conn in a thread and commit; returns (thread, outcome)."""
+    outcome = {}
+
+    def run():
+        try:
+            conn.execute(statement, params)
+            conn.commit()
+            outcome["ok"] = True
+        except psycopg.Error as exc:  # reported by the caller
+            conn.rollback()
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def _finished_or_waiting(admin, thread, pid, timeout_seconds=5.0):
+    """Wait until the thread is done or its session waits for a lock."""
+    deadline = time.monotonic() + timeout_seconds
+    while thread.is_alive() and time.monotonic() < deadline:
+        row = admin.execute(
+            "select wait_event_type = 'Lock' from pg_stat_activity where pid = %s",
+            (pid,),
+        ).fetchone()
+        if row and row[0]:
+            return
+        time.sleep(0.02)
+    assert not thread.is_alive(), "neither finished nor waited for a lock"
+
+
+@pytest.mark.parametrize("state", ("missing", "outdated", "current"))
+def test_concurrent_regeneration_of_a_claim_function(admin, db_dsn, state):
+    # ensure_claim_function() (here through the migration's direct call and
+    # create_queue()) creates or replaces ct_<queue> when it is missing or
+    # differs from the generated one.  Two transactions doing that for the same
+    # queue must not both write pg_proc: the second would wait for the first
+    # and then fail with a unique violation (missing) or "tuple concurrently
+    # updated" (outdated).
+    queue = f"cf_regen_{state}"
+    admin.execute("select absurd.create_queue(%s)", (queue,))
+    try:
+        if state == "missing":
+            admin.execute(
+                sql.SQL("drop function absurd.{}(text, integer, integer)").format(
+                    sql.Identifier(f"ct_{queue}")
+                )
+            )
+        elif state == "outdated":
+            install_sentinel(admin, queue)
+        before = claim_fn_version(admin, queue)
+
+        with psycopg.connect(db_dsn) as first, psycopg.connect(db_dsn) as second:
+            first.execute("select absurd.ensure_claim_function(%s)", (queue,))
+            thread, outcome = _start(second, "select absurd.create_queue(%s)", (queue,))
+            _finished_or_waiting(admin, thread, second.info.backend_pid)
+            first.commit()
+            thread.join(10)
+            assert not thread.is_alive()
+            assert outcome == {"ok": True}, outcome.get("error")
+
+        after = claim_fn_version(admin, queue)
+        assert after is not None
+        if state == "current":
+            assert after == before  # neither transaction rewrote it
+        prosrc = admin.execute(
+            "select prosrc from pg_proc where oid = %s", (after[0],)
+        ).fetchone()[0]
+        assert "sentinel" not in prosrc
+        assert claim_fn_owner(admin, queue) == table_owner(admin, queue)
+        admin.execute("select absurd.spawn_task(%s, 't', '{}')", (queue,))
+        assert [
+            r[3]
+            for r in admin.execute("select * from absurd.claim_task(%s, 'w')", (queue,))
+        ] == ["t"]
+    finally:
+        admin.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+@pytest.mark.parametrize("state", ("missing", "outdated"))
+def test_drop_queue_and_claim_function_regeneration_do_not_race(admin, db_dsn, state):
+    # drop_queue() and ensure_claim_function() for the same queue must not
+    # leave a claim function behind for a dropped queue, nor deadlock.  A
+    # session reading the queue's checkpoint table stalls drop_queue() part way
+    # through, so the regeneration arrives while the drop is in progress.
+    queue = f"cf_dropregen_{state}"
+    admin.execute("select absurd.create_queue(%s)", (queue,))
+    try:
+        if state == "missing":
+            admin.execute(
+                sql.SQL("drop function absurd.{}(text, integer, integer)").format(
+                    sql.Identifier(f"ct_{queue}")
+                )
+            )
+        else:
+            install_sentinel(admin, queue)
+
+        with (
+            psycopg.connect(db_dsn) as reader,
+            psycopg.connect(db_dsn) as dropper,
+            psycopg.connect(db_dsn) as regenerator,
+        ):
+            for conn in (dropper, regenerator):
+                conn.execute("set deadlock_timeout = '100ms'")
+                conn.execute("set statement_timeout = '10s'")
+                conn.commit()
+            reader.execute(
+                sql.SQL("select from absurd.{} limit 0").format(
+                    sql.Identifier(f"c_{queue}")
+                )
+            )
+            drop_thread, dropped = _start(
+                dropper, "select absurd.drop_queue(%s)", (queue,)
+            )
+            _finished_or_waiting(admin, drop_thread, dropper.info.backend_pid)
+            assert drop_thread.is_alive(), dropped
+            regen_thread, regenerated = _start(
+                regenerator, "select absurd.ensure_claim_function(%s)", (queue,)
+            )
+            _finished_or_waiting(admin, regen_thread, regenerator.info.backend_pid)
+            reader.rollback()
+            drop_thread.join(10)
+            regen_thread.join(10)
+            assert not drop_thread.is_alive() and not regen_thread.is_alive()
+            assert dropped == {"ok": True}, dropped.get("error")
+            assert regenerated == {"ok": True}, regenerated.get("error")
+
+        assert claim_fn_owner(admin, queue) is None
+        assert admin.execute(
+            "select count(*) from absurd.queues where queue_name = %s", (queue,)
+        ).fetchone() == (0,)
+        assert admin.execute(
+            "select to_regclass(%s)", (f"absurd.t_{queue}",)
+        ).fetchone() == (None,)
+    finally:
+        admin.execute(
+            sql.SQL("drop function if exists absurd.{}(text, integer, integer)").format(
+                sql.Identifier(f"ct_{queue}")
+            )
+        )
+        admin.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+def test_queue_owner_drops_a_queue_whose_claim_function_another_role_owns(
+    admin, db_dsn
+):
+    # claim_task() ignores a ct_<queue> owned by a role other than the owner
+    # of the queue's tables, and ensure_claim_function() cannot replace it.
+    # Such a function must not stop the queue owner from dropping the queue;
+    # it is left to its owner.
+    queue, owner, planter = "cf_drop_foreign", "cf_drop_owner", "cf_drop_planter"
+    try:
+        for role in (owner, planter):
+            admin.execute(sql.SQL("create role {}").format(sql.Identifier(role)))
+            admin.execute(
+                sql.SQL("grant usage, create on schema absurd to {}").format(
+                    sql.Identifier(role)
+                )
+            )
+        admin.execute(
+            sql.SQL(
+                "grant select, insert, update, delete on absurd.queues to {}"
+            ).format(sql.Identifier(owner))
+        )
+        with as_role(db_dsn, owner) as conn:
+            conn.execute("select absurd.create_queue(%s)", (queue,))
+            conn.execute(
+                sql.SQL("drop function absurd.{}(text, integer, integer)").format(
+                    sql.Identifier(f"ct_{queue}")
+                )
+            )
+        with as_role(db_dsn, planter) as conn:
+            install_sentinel(conn, queue)
+        assert claim_fn_owner(admin, queue) == planter
+        assert table_owner(admin, queue) == owner
+
+        with as_role(db_dsn, owner) as conn:
+            conn.execute("select absurd.drop_queue(%s)", (queue,))
+
+        assert admin.execute(
+            "select count(*) from absurd.queues where queue_name = %s", (queue,)
+        ).fetchone() == (0,)
+        for prefix in "trcew":
+            assert admin.execute(
+                "select to_regclass(%s)", (f"absurd.{prefix}_{queue}",)
+            ).fetchone() == (None,)
+        assert claim_fn_owner(admin, queue) == planter
+    finally:
+        admin.execute(
+            sql.SQL("drop function if exists absurd.{}(text, integer, integer)").format(
+                sql.Identifier(f"ct_{queue}")
+            )
+        )
+        admin.execute("select absurd.drop_queue(%s)", (queue,))
+        drop_roles(admin, owner, planter)
+
+
+# -- upgrading restricted installations ------------------------------------------
+
+
+def test_restricted_queue_owner_creates_queues_after_the_upgrade(new_database):
+    # An installation whose installing role withholds PUBLIC EXECUTE and grants
+    # a queue-managing role EXECUTE on the 0.5.0 functions.  The migration adds
+    # ensure_claim_function(), on which that role has no EXECUTE.  It must
+    # still create queues (on claim_task()'s dynamic statements) until it is
+    # granted EXECUTE on the new function.
+    dsn = new_database("cf_upgrade_revoked")
+    role = "cf_upgrade_queue_owner"
+    with psycopg.connect(dsn, autocommit=True) as admin:
+        admin.execute(
+            "alter default privileges revoke execute on functions from public"
+        )
+        admin.execute(ABSURD_0_5_0.read_text())
+        admin.execute(sql.SQL("create role {}").format(sql.Identifier(role)))
+        try:
+            ident = sql.Identifier(role)
+            admin.execute(
+                sql.SQL("grant usage, create on schema absurd to {}").format(ident)
+            )
+            admin.execute(
+                sql.SQL(
+                    "grant select, insert, update, delete on absurd.queues to {}"
+                ).format(ident)
+            )
+            admin.execute(
+                sql.SQL("grant execute on all functions in schema absurd to {}").format(
+                    ident
+                )
+            )
+            with as_role(dsn, role) as conn:
+                conn.execute("select absurd.create_queue('before')")
+
+            admin.execute(migration_sql())
+            assert admin.execute(
+                "select has_function_privilege(%s, "
+                "'absurd.ensure_claim_function(text)', 'execute')",
+                (role,),
+            ).fetchone() == (False,)
+
+            with as_role(dsn, role) as conn:
+                conn.execute("select absurd.create_queue('before')")
+                conn.execute("select absurd.create_queue('after')")
+                conn.execute("select absurd.create_queue('after_p', 'partitioned')")
+                for queue in ("after", "after_p"):
+                    assert claim_fn_owner(conn, queue) is None
+                    conn.execute("select absurd.spawn_task(%s, 't', '{}')", (queue,))
+                    assert [
+                        r[3]
+                        for r in conn.execute(
+                            "select * from absurd.claim_task(%s, 'w')", (queue,)
+                        )
+                    ] == ["t"]
+
+            # Granted EXECUTE on the new function, it gets the claim functions.
+            admin.execute(
+                sql.SQL(
+                    "grant execute on function absurd.ensure_claim_function(text) to {}"
+                ).format(ident)
+            )
+            with as_role(dsn, role) as conn:
+                conn.execute("select absurd.create_queue('after')")
+                assert claim_fn_owner(conn, "after") == role
+        finally:
+            admin.execute(sql.SQL("drop owned by {}").format(sql.Identifier(role)))
+            admin.execute(sql.SQL("drop role {}").format(sql.Identifier(role)))
+
+
+def _apply_like_absurdctl(postgres_container, dbname, sql_text, *, options=None):
+    """Apply SQL the way absurdctl migrate does: psql -v ON_ERROR_STOP=1 -f -.
+
+    Each statement commits on its own; psql stops at the first error.
+    """
+    env = ["-e", f"PGOPTIONS={options}"] if options else []
+    return subprocess.run(
+        [
+            "docker",
+            "exec",
+            "-i",
+            *env,
+            postgres_container.get_wrapped_container().id,
+            "psql",
+            "-U",
+            postgres_container.username,
+            "-d",
+            dbname,
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-f",
+            "-",
+        ],
+        input=sql_text,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def _definitions(conn):
+    """Function definitions and relations of schema absurd, minus queue objects."""
+    return {
+        "functions": conn.execute(
+            "select p.oid::regprocedure::text, pg_get_functiondef(p.oid) "
+            "from pg_proc p where p.pronamespace = 'absurd'::regnamespace "
+            "and p.proname !~ '^ct_' order by 1"
+        ).fetchall(),
+        "queues_table": conn.execute(
+            "select attname, format_type(atttypid, atttypmod), attnotnull "
+            "from pg_attribute where attrelid = 'absurd.queues'::regclass "
+            "and attnum > 0 and not attisdropped order by attnum"
+        ).fetchall(),
+    }
+
+
+def test_migration_failing_late_does_not_claim_main_and_reruns(
+    new_database, postgres_container
+):
+    # absurdctl migrate applies the file with ON_ERROR_STOP but without a
+    # transaction.  A statement failing late (here: renaming a partition that
+    # another session reads, under lock_timeout) must leave the database
+    # reporting 0.5.0, so that the next migrate applies the file again, and
+    # must not leave the new partition tag beside the old partition names.
+    dbname = "cf_mig_late"
+    dsn = new_database(dbname)
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(ABSURD_0_5_0.read_text())
+        conn.execute("select absurd.create_queue('busy', 'partitioned')")
+        conn.execute("select absurd.spawn_task('busy', 't', '{}')")
+
+        def old_partitions():
+            return [
+                r[0]
+                for r in conn.execute(
+                    "select relname from pg_class "
+                    "where relname ~ '^[trcw]_busy_[0-9]{3}$' order by 1"
+                )
+            ]
+
+        partitions = old_partitions()
+        assert partitions
+
+        with psycopg.connect(dsn) as reader:
+            reader.execute(
+                sql.SQL("select from absurd.{} limit 0").format(
+                    sql.Identifier(partitions[-1])
+                )
+            )
+            failed = _apply_like_absurdctl(
+                postgres_container,
+                dbname,
+                migration_sql(),
+                options="-c lock_timeout=200ms",
+            )
+        assert failed.returncode != 0
+        assert "lock timeout" in failed.stderr, failed.stderr
+
+        assert conn.execute("select absurd.get_schema_version()").fetchone() == (
+            "0.5.0",
+        )
+        assert old_partitions() == partitions
+        # The partition tag still matches the partition names.
+        assert (
+            len(conn.execute("select absurd.partition_week_tag(now())").fetchone()[0])
+            == 3
+        )
+        conn.execute("select absurd.ensure_partitions('busy')")
+        assert old_partitions() == partitions
+
+        rerun = _apply_like_absurdctl(postgres_container, dbname, migration_sql())
+        assert rerun.returncode == 0, rerun.stderr
+        assert conn.execute("select absurd.get_schema_version()").fetchone() == (
+            "main",
+        )
+        assert old_partitions() == []
+        assert claim_fn_exists_conn(conn, "busy")
+        assert [
+            r[3] for r in conn.execute("select * from absurd.claim_task('busy', 'w')")
+        ] == ["t"]
+
+        fresh_dsn = new_database("cf_mig_late_fresh")
+        with psycopg.connect(fresh_dsn, autocommit=True) as fresh:
+            fresh.execute((TESTS.parent / "sql" / "absurd.sql").read_text())
+            assert _definitions(conn) == _definitions(fresh)
