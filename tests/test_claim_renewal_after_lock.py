@@ -13,8 +13,10 @@ from test_lock_ordering import (
 # A renewal that waits on a row lock must count from when it writes the claim, not from before the
 # wait: a time read first renews to an expiry already in the past once the wait outlasts the
 # extension, and the run loses a claim it was actively renewing.
-HOLD_SECONDS = 2.5
-EXTEND_SECONDS = 1
+# Keep enough post-renewal margin for the follow-up connection on slow workers while still
+# holding the lock beyond the entire requested extension.
+EXTEND_SECONDS = 10
+HOLD_SECONDS = EXTEND_SECONDS + 2
 
 _EXTEND = "select absurd.extend_claim(%(queue)s, %(run)s, %(seconds)s)"
 _CHECKPOINT = (
