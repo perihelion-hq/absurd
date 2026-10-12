@@ -1025,6 +1025,17 @@ def install_0_5_0(new_database, name):
     return conn
 
 
+def db_week_tag(conn):
+    """The database's current IYYYIW week tag.
+
+    Read after a partitioned queue was created: its lookahead window covers
+    this week even if the week changed during the setup.
+    """
+    return conn.execute(
+        "select to_char(absurd.week_bucket_utc(clock_timestamp()) at time zone 'UTC', 'IYYYIW')"
+    ).fetchone()[0]
+
+
 def schema_snapshot(conn):
     """Everything the migration may change, as plain data."""
     return {
@@ -1188,10 +1199,9 @@ def test_migration_refuses_partition_renames_onto_another_queue_and_changes_noth
     # The migration must refuse before changing anything, in both ways it is
     # applied, and run once the documented remediation is done.
     dbname = "cf_mig_collide"
-    year, week, _ = datetime.now(timezone.utc).isocalendar()
-    tag = f"{year}{week:02d}"
     with install_0_5_0(new_database, dbname) as conn:
         conn.execute("select absurd.create_queue('jobs', 'partitioned')")
+        tag = db_week_tag(conn)
         conn.execute("select absurd.create_queue(%s)", (f"jobs_{tag}",))
         conn.execute("select absurd.spawn_task(%s, 't', '{}')", (f"jobs_{tag}",))
         old_partition = f"t_jobs_{tag[3:]}"
@@ -1360,13 +1370,12 @@ def test_migration_refuses_a_colliding_queue_created_concurrently(new_database, 
     # must wait for it and fail instead of renaming a partition onto the name
     # the new queue then silently shares; the next run reports the collision.
     dsn = new_database("cf_mig_racecollide")
-    year, week, _ = datetime.now(timezone.utc).isocalendar()
-    tag = f"{year}{week:02d}"
     migration = migration_sql()
     split = migration.index("-- Make weekly partition tags year-unique")
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute(ABSURD_0_5_0.read_text())
         conn.execute("select absurd.create_queue('busy', 'partitioned')")
+        tag = db_week_tag(conn)
         conn.execute(migration[:split])
         before = _old_style_partitions(conn, "busy")
         assert before
@@ -1389,6 +1398,89 @@ def test_migration_refuses_a_colliding_queue_created_concurrently(new_database, 
         with pytest.raises(psycopg.errors.DuplicateTable) as exc:
             conn.execute(migration)
         assert f"t_busy_{tag[3:]} -> t_busy_{tag}" in str(exc.value)
+
+
+def test_partition_maintenance_waiting_for_the_rename_uses_the_new_tag(
+    new_database, admin
+):
+    # ensure_partitions() started while the rename statement is uncommitted
+    # must not compute an old-style tag and create that partition once the
+    # migration commits.
+    dsn = new_database("cf_mig_waiting_maint")
+    migration = migration_sql()
+    split = migration.index("-- Make weekly partition tags year-unique")
+    end = migration.index("-- Create the claim function for every existing queue")
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(ABSURD_0_5_0.read_text())
+        conn.execute("select absurd.create_queue('busy', 'partitioned')")
+        conn.execute(migration[:split])
+
+        with psycopg.connect(dsn) as migrator, psycopg.connect(dsn) as maintainer:
+            migrator.execute(migration[split:end])
+            maintainer.execute(
+                "select set_config('absurd.fake_now', %s, false)",
+                (datetime(2031, 6, 2, 12, tzinfo=timezone.utc).isoformat(),),
+            )
+            maintainer.commit()
+            thread, maintained = _start(
+                maintainer, "select absurd.ensure_partitions('busy')", None
+            )
+            _finished_or_waiting(admin, thread, maintainer.info.backend_pid)
+            migrator.commit()
+            thread.join(30)
+            assert not thread.is_alive()
+            assert maintained == {"ok": True}, maintained.get("error")
+
+        conn.execute(migration[end:])
+        assert conn.execute("select absurd.get_schema_version()").fetchone() == (
+            "main",
+        )
+        assert _old_style_partitions(conn, "busy") == []
+        assert (
+            conn.execute(
+                "select count(*) from pg_class where relname ~ '^t_busy_2031[0-9]{2}$'"
+            ).fetchone()[0]
+            > 0
+        )
+        conn.execute("select absurd.ensure_partitions()")
+
+
+def test_migration_and_a_registry_writer_do_not_deadlock(new_database, admin):
+    # A transaction that changes one queue's registry row and then locks
+    # another queue's row while the rename statement locks the registry.  The
+    # rename must wait for it instead of holding queue rows the writer needs.
+    dsn = new_database("cf_mig_registry_writer")
+    migration = migration_sql()
+    split = migration.index("-- Make weekly partition tags year-unique")
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(ABSURD_0_5_0.read_text())
+        conn.execute("select absurd.create_queue('busy', 'partitioned')")
+        conn.execute("select absurd.create_queue('zz')")
+        conn.execute(migration[:split])
+
+        with psycopg.connect(dsn) as writer, psycopg.connect(dsn) as migrator:
+            for c in (writer, migrator):
+                c.execute("set deadlock_timeout = '100ms'")
+                c.execute("set statement_timeout = '20s'")
+                c.commit()
+            writer.execute(
+                "update absurd.queues set cleanup_limit = 10 where queue_name = 'zz'"
+            )
+            thread, migrated = _start(migrator, migration[split:], None)
+            _finished_or_waiting(admin, thread, migrator.info.backend_pid)
+            writer.execute(
+                "select 1 from absurd.queues where queue_name = 'busy' "
+                "for no key update"
+            )
+            writer.commit()
+            thread.join(30)
+            assert not thread.is_alive()
+            assert migrated == {"ok": True}, migrated.get("error")
+
+        assert conn.execute("select absurd.get_schema_version()").fetchone() == (
+            "main",
+        )
+        assert _old_style_partitions(conn, "busy") == []
 
 
 def test_migration_refuses_a_long_queue_name_created_concurrently(new_database, admin):

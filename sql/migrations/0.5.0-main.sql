@@ -41,7 +41,8 @@
 -- No row data is rewritten.  Function definitions are replaced, claim
 -- functions are created, and the existing weekly partitions of partitioned
 -- queues (and the indexes named after them) are renamed to the new tags,
--- after waiting for any concurrent partition creation on those queues.
+-- under an ACCESS EXCLUSIVE lock on absurd.queues that waits for concurrent
+-- queue and partition maintenance and briefly blocks reads of that table.
 -- This file contains no BEGIN/COMMIT.  Apply it as one transaction (for
 -- example psql -v ON_ERROR_STOP=1 -1 -f ...) so a failure leaves the 0.5.0
 -- schema untouched.  With ON_ERROR_STOP alone (as absurdctl migrate applies
@@ -1595,7 +1596,6 @@ $$;
 -- partitions that already carry a new-style tag.  Safe to re-run.
 do $$
 declare
-  v_parent record;
   v_partition record;
   v_lower uuid;
   v_new_name text;
@@ -1628,35 +1628,28 @@ as $fn$
   from bucket;
 $fn$;
 
-  -- Lock the registry before any partition, the order create_queue(),
-  -- set_queue_policy() and drop_queue() use (queue row, then its tables).
-  -- First every queue's row, in queue name order: a policy change or drop in
-  -- progress holds its row, and finishes first.  Then SHARE on the table:
-  -- it waits for every queue creation, policy change and drop still running
-  -- (each holds ROW EXCLUSIVE) and blocks new ones until this transaction
-  -- ends, so no queue appears or changes after the list below is read.  When
-  -- this file is applied as one transaction, both are held through the claim
-  -- function backfill below, whose row locks then never wait for a policy
-  -- change that waits for the partitions locked here.  Reads of
-  -- absurd.queues are not blocked.
+  -- Take ACCESS EXCLUSIVE on the queue registry before listing anything.
+  -- Every function that creates partitions or queues reads absurd.queues
+  -- first (ensure_partitions(), create_queue(), set_queue_policy()), and
+  -- drop_queue() deletes from it, so this waits for each such call in
+  -- progress, including one that has computed an old-style tag and waits for
+  -- a partition lock, and makes every later call wait until this transaction
+  -- commits and then use the new partition_week_tag().  No partition or queue
+  -- therefore appears after the list below is read.  It is one lock, so it
+  -- cannot be taken in an order that deadlocks with the registry-row-first
+  -- order of those functions, and when this file is applied as one
+  -- transaction it is held through the claim function backfill, whose row
+  -- locks then never wait for another session.  It also blocks plain reads
+  -- of absurd.queues (spawn_task() and the maintenance functions) until this
+  -- transaction ends; a long transaction that has read absurd.queues delays
+  -- it (with lock_timeout set the statement fails, changes nothing, and the
+  -- file can be applied again).
   --
-  -- Then wait for, and block, partition creation on every partitioned queue
-  -- (in the order ensure_partitions() creates them: queue name, then t, r, c,
-  -- w), so that a partition created by a concurrent ensure_partitions() is
-  -- renamed too instead of staying behind under an old-style tag.
-  --
-  -- A queue created concurrently that owns a new partition name is caught by
-  -- the collision preflight above on the next run: the rename below then
-  -- fails with "already exists" and changes nothing.  One over the name limit
-  -- is refused right after the locks.
-  perform count(*)
-    from (
-      select 1
-        from absurd.queues q
-       order by q.queue_name
-         for no key update
-    ) l;
-  lock table absurd.queues in share mode;
+  -- A queue created concurrently that owns a new partition name makes the
+  -- rename below fail with "already exists" and change nothing; the
+  -- collision preflight above lists it on the next run.  One over the name
+  -- limit is refused right here.
+  lock table absurd.queues in access exclusive mode;
 
   -- A queue over the name limit created after the first preflight: its new
   -- partition names would be truncated.  Refuse as that preflight does.
@@ -1665,19 +1658,6 @@ $fn$;
       using hint = 'Apply this migration again to list the queues and the remediation.',
             errcode = 'check_violation';
   end if;
-
-  for v_parent in
-    select parent.relname
-      from absurd.queues q
-      join pg_catalog.pg_class parent
-        on parent.relnamespace = 'absurd'::regnamespace
-       and parent.relname in ('t_' || q.queue_name, 'r_' || q.queue_name,
-                              'c_' || q.queue_name, 'w_' || q.queue_name)
-     where q.storage_mode = 'partitioned'
-     order by q.queue_name, strpos('trcw', left(parent.relname, 1))
-  loop
-    execute format('lock table absurd.%I in share update exclusive mode', v_parent.relname);
-  end loop;
 
   for v_partition in
     select child.oid as child_oid,
