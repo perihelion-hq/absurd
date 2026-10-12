@@ -1628,11 +1628,44 @@ as $fn$
   from bucket;
 $fn$;
 
-  -- Wait for, and then block, partition creation on every partitioned queue
+  -- Lock the registry before any partition, the order create_queue(),
+  -- set_queue_policy() and drop_queue() use (queue row, then its tables).
+  -- First every queue's row, in queue name order: a policy change or drop in
+  -- progress holds its row, and finishes first.  Then SHARE on the table:
+  -- it waits for every queue creation, policy change and drop still running
+  -- (each holds ROW EXCLUSIVE) and blocks new ones until this transaction
+  -- ends, so no queue appears or changes after the list below is read.  When
+  -- this file is applied as one transaction, both are held through the claim
+  -- function backfill below, whose row locks then never wait for a policy
+  -- change that waits for the partitions locked here.  Reads of
+  -- absurd.queues are not blocked.
+  --
+  -- Then wait for, and block, partition creation on every partitioned queue
   -- (in the order ensure_partitions() creates them: queue name, then t, r, c,
-  -- w) before listing the partitions, so that one created by a concurrent
-  -- ensure_partitions() is renamed too instead of staying behind under an
-  -- old-style tag.  The lock does not block reads or writes of queue rows.
+  -- w), so that a partition created by a concurrent ensure_partitions() is
+  -- renamed too instead of staying behind under an old-style tag.
+  --
+  -- A queue created concurrently that owns a new partition name is caught by
+  -- the collision preflight above on the next run: the rename below then
+  -- fails with "already exists" and changes nothing.  One over the name limit
+  -- is refused right after the locks.
+  perform count(*)
+    from (
+      select 1
+        from absurd.queues q
+       order by q.queue_name
+         for no key update
+    ) l;
+  lock table absurd.queues in share mode;
+
+  -- A queue over the name limit created after the first preflight: its new
+  -- partition names would be truncated.  Refuse as that preflight does.
+  if exists (select 1 from absurd.queues where octet_length(queue_name) > 53) then
+    raise exception 'Cannot migrate to main: a queue name over 53 bytes was created during the migration'
+      using hint = 'Apply this migration again to list the queues and the remediation.',
+            errcode = 'check_violation';
+  end if;
+
   for v_parent in
     select parent.relname
       from absurd.queues q

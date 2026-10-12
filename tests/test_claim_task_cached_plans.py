@@ -56,7 +56,9 @@ def make_queue(request, client):
             assert not claim_fn_exists(client, name)
         else:
             mode = "force_" + request.param
-            client.conn.execute("select set_config('plan_cache_mode', %s, false)", (mode,))
+            client.conn.execute(
+                "select set_config('plan_cache_mode', %s, false)", (mode,)
+            )
         return name
 
     return make
@@ -619,7 +621,9 @@ def test_migration_renames_existing_partitions_to_year_unique_tags(client):
 def test_repeated_polls_on_one_session(client, plan_cache_mode):
     # Behavioural companion to the static-SQL assertion above: many polls on a
     # single session (plpgsql plan cache warm) keep returning the right answer.
-    client.conn.execute("select set_config('plan_cache_mode', %s, false)", (plan_cache_mode,))
+    client.conn.execute(
+        "select set_config('plan_cache_mode', %s, false)", (plan_cache_mode,)
+    )
     client.conn.commit()
     queue = "cf_poll"
     client.create_queue(queue)
@@ -865,13 +869,17 @@ def test_restricted_worker_role_runs_the_generated_function(new_database):
     with psycopg.connect(dsn, autocommit=True) as admin:
         # No function, including the ones create_queue() generates later, is
         # executable by PUBLIC.
-        admin.execute("alter default privileges revoke execute on functions from public")
+        admin.execute(
+            "alter default privileges revoke execute on functions from public"
+        )
         admin.execute((TESTS.parent / "sql" / "absurd.sql").read_text())
         admin.execute("select absurd.create_queue(%s)", (queue,))
         admin.execute(sql.SQL("create role {}").format(sql.Identifier(role)))
         try:
             admin.execute(
-                sql.SQL("grant usage on schema absurd to {}").format(sql.Identifier(role))
+                sql.SQL("grant usage on schema absurd to {}").format(
+                    sql.Identifier(role)
+                )
             )
             for fn in (*WORKER_FUNCTIONS, ct):
                 admin.execute(
@@ -887,6 +895,7 @@ def test_restricted_worker_role_runs_the_generated_function(new_database):
                         sql.Identifier(role),
                     )
                 )
+
             def scenario(expect_generated_calls):
                 """Exercise every statement of the claim path as the worker."""
                 admin.execute("truncate absurd.w_rq, absurd.r_rq, absurd.t_rq cascade")
@@ -916,7 +925,9 @@ def test_restricted_worker_role_runs_the_generated_function(new_database):
                         "absurd.claim_task(%s, 'w1', 60, 1)",
                         (queue,),
                     ).fetchall()
-                    assert [(r[0], r[1], r[2]) for r in rows] == [(first_run, "first", 1)]
+                    assert [(r[0], r[1], r[2]) for r in rows] == [
+                        (first_run, "first", 1)
+                    ]
                     assert ct_calls() == expect_generated_calls
                     worker.commit()
                     row = admin.execute(
@@ -930,14 +941,20 @@ def test_restricted_worker_role_runs_the_generated_function(new_database):
                     assert row[3:] == ("running", 1)
 
                     # Cancellation sweep: a task past its max_delay.
-                    doomed_task, _ = spawn("doomed", '{"cancellation": {"max_delay": 1}}')
+                    doomed_task, _ = spawn(
+                        "doomed", '{"cancellation": {"max_delay": 1}}'
+                    )
                     worker.execute("set absurd.fake_now = '2030-01-01T00:00:10Z'")
-                    assert worker.execute(
-                        "select * from absurd.claim_task(%s, 'w1', 60, 1)", (queue,)
-                    ).fetchall() == []
+                    assert (
+                        worker.execute(
+                            "select * from absurd.claim_task(%s, 'w1', 60, 1)", (queue,)
+                        ).fetchall()
+                        == []
+                    )
                     worker.commit()
                     assert admin.execute(
-                        "select state from absurd.t_rq where task_id = %s", (doomed_task,)
+                        "select state from absurd.t_rq where task_id = %s",
+                        (doomed_task,),
                     ).fetchone() == ("cancelled",)
 
                     # Expired-lease sweep: the first run's 60 s lease lapses and
@@ -968,7 +985,9 @@ def test_restricted_worker_role_runs_the_generated_function(new_database):
                         "select * from absurd.await_event(%s, %s, %s, 'step', 'evt', 10)",
                         (queue, first_task, retry_run),
                     )
-                    assert admin.execute("select count(*) from absurd.w_rq").fetchone() == (1,)
+                    assert admin.execute(
+                        "select count(*) from absurd.w_rq"
+                    ).fetchone() == (1,)
                     worker.execute("set absurd.fake_now = '2030-01-01T00:02:11Z'")
                     rows = worker.execute(
                         "select run_id, wake_event from absurd.claim_task(%s, 'w3', 60, 1)",
@@ -976,7 +995,9 @@ def test_restricted_worker_role_runs_the_generated_function(new_database):
                     ).fetchall()
                     assert rows == [(retry_run, "evt")]
                     worker.commit()
-                    assert admin.execute("select count(*) from absurd.w_rq").fetchone() == (0,)
+                    assert admin.execute(
+                        "select count(*) from absurd.w_rq"
+                    ).fetchone() == (0,)
 
             scenario(expect_generated_calls=1)
 
@@ -1069,7 +1090,9 @@ def test_migration_refuses_queues_over_the_new_name_limit_and_changes_nothing(
         # the name), recreate under a shorter name, then migrate.
         conn.execute("select absurd.drop_queue(%s)", (long_queue,))
         conn.execute(migration_sql())
-        assert conn.execute("select absurd.get_schema_version()").fetchone() == ("main",)
+        assert conn.execute("select absurd.get_schema_version()").fetchone() == (
+            "main",
+        )
         conn.execute("select absurd.create_queue(%s, %s)", ("q" * 53, storage_mode))
 
 
@@ -1080,8 +1103,12 @@ def test_migration_twice_on_a_populated_partitioned_queue_from_0_5_0(new_databas
         # Spread work over several weeks of the partition window.
         runs = []
         for week in range(-1, 4):
-            moment = datetime(2030, 1, 7, 12, tzinfo=timezone.utc) + timedelta(weeks=week)
-            conn.execute("select set_config('absurd.fake_now', %s, false)", (moment.isoformat(),))
+            moment = datetime(2030, 1, 7, 12, tzinfo=timezone.utc) + timedelta(
+                weeks=week
+            )
+            conn.execute(
+                "select set_config('absurd.fake_now', %s, false)", (moment.isoformat(),)
+            )
             conn.execute("select absurd.ensure_partitions(%s)", (queue,))
             for i in range(3):
                 runs.append(
@@ -1090,7 +1117,10 @@ def test_migration_twice_on_a_populated_partitioned_queue_from_0_5_0(new_databas
                         (queue, f"w{week}-{i}"),
                     ).fetchone()[0]
                 )
-        conn.execute("select set_config('absurd.fake_now', %s, false)", (datetime(2030, 1, 22, 12, tzinfo=timezone.utc).isoformat(),))
+        conn.execute(
+            "select set_config('absurd.fake_now', %s, false)",
+            (datetime(2030, 1, 22, 12, tzinfo=timezone.utc).isoformat(),),
+        )
         claimed = conn.execute(
             "select run_id from absurd.claim_task(%s, 'w', 600, 4)", (queue,)
         ).fetchall()
@@ -1126,15 +1156,18 @@ def test_migration_twice_on_a_populated_partitioned_queue_from_0_5_0(new_databas
 
         # Data is untouched and the queue works: ensure_partitions finds every
         # week's partition by its new name and adds none beside it.
-        assert conn.execute(
-            "select count(*) from absurd.r_" + queue
-        ).fetchone() == (len(runs),)
+        assert conn.execute("select count(*) from absurd.r_" + queue).fetchone() == (
+            len(runs),
+        )
         conn.execute("select absurd.ensure_partitions(%s)", (queue,))
         conn.execute("select absurd.ensure_partitions()")
         assert partition_names() == names
 
         # ... and a later week gets a new partition, with work claimable from it.
-        conn.execute("select set_config('absurd.fake_now', %s, false)", (datetime(2030, 3, 4, 12, tzinfo=timezone.utc).isoformat(),))
+        conn.execute(
+            "select set_config('absurd.fake_now', %s, false)",
+            (datetime(2030, 3, 4, 12, tzinfo=timezone.utc).isoformat(),),
+        )
         conn.execute("select absurd.ensure_partitions(%s)", (queue,))
         assert len(partition_names()) > len(names)
         later = conn.execute(
@@ -1226,12 +1259,167 @@ def test_migration_renames_a_partition_created_concurrently(new_database, admin)
         assert conn.execute("select absurd.get_schema_version()").fetchone() == (
             "main",
         )
+        assert (
+            conn.execute(
+                "select relname from pg_class where relname ~ '^[trcw]_busy_[0-9]{3}$'"
+            ).fetchall()
+            == []
+        )
+        assert (
+            conn.execute(
+                "select count(*) from pg_class where relname ~ '^t_busy_2031[0-9]{2}$'"
+            ).fetchone()[0]
+            > 0
+        )
+
+
+def _old_style_partitions(conn, queue):
+    return conn.execute(
+        "select relname from pg_class where relname ~ %s order by 1",
+        (f"^[trcw]_{queue}_[0-9]{{3}}$",),
+    ).fetchall()
+
+
+def test_migration_renames_partitions_of_a_queue_created_concurrently(
+    new_database, admin
+):
+    # A partitioned queue created (with partitions under the still old tag)
+    # in a transaction uncommitted when the rename statement starts must have
+    # its partitions renamed too.
+    dsn = new_database("cf_mig_newqueue")
+    migration = migration_sql()
+    split = migration.index("-- Make weekly partition tags year-unique")
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(ABSURD_0_5_0.read_text())
+        conn.execute("select absurd.create_queue('busy', 'partitioned')")
+        conn.execute(migration[:split])
+
+        with psycopg.connect(dsn) as creator, psycopg.connect(dsn) as migrator:
+            creator.execute("select absurd.create_queue('late', 'partitioned')")
+            assert _old_style_partitions(creator, "late")
+            thread, migrated = _start(migrator, migration[split:], None)
+            _finished_or_waiting(admin, thread, migrator.info.backend_pid)
+            creator.commit()
+            thread.join(30)
+            assert not thread.is_alive()
+            assert migrated == {"ok": True}, migrated.get("error")
+
+        assert _old_style_partitions(conn, "late") == []
+        assert _old_style_partitions(conn, "busy") == []
+        conn.execute("select absurd.ensure_partitions()")
+        conn.execute("select absurd.spawn_task('late', 't', '{}')")
+        assert [
+            r[3] for r in conn.execute("select * from absurd.claim_task('late', 'w')")
+        ] == ["t"]
+
+
+def test_migration_in_one_transaction_and_a_policy_change_do_not_deadlock(
+    new_database, admin
+):
+    # Applied as one transaction, the migration holds the partition locks of
+    # the rename while its claim function backfill locks queue rows.  0.5.0's
+    # set_queue_policy() locks the queue row and then the partitions.
+    dsn = new_database("cf_mig_policy")
+    migration = migration_sql()
+    split = migration.index("-- Create the claim function for every existing queue")
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(ABSURD_0_5_0.read_text())
+        conn.execute("select absurd.create_queue('busy', 'partitioned')")
+
+    with psycopg.connect(dsn) as migrator, psycopg.connect(dsn) as policy:
+        for c in (migrator, policy):
+            c.execute("set deadlock_timeout = '100ms'")
+            c.execute("set statement_timeout = '20s'")
+            c.commit()
+        migrator.execute(migration[:split])
+        thread, changed = _start(
+            policy,
+            "select absurd.set_queue_policy('busy', %s)",
+            ('{"default_partition": "disabled"}',),
+        )
+        _finished_or_waiting(admin, thread, policy.info.backend_pid)
+        migrator.execute(migration[split:])
+        migrator.commit()
+        thread.join(30)
+        assert not thread.is_alive()
+        assert changed == {"ok": True}, changed.get("error")
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        assert conn.execute("select absurd.get_schema_version()").fetchone() == (
+            "main",
+        )
+        assert claim_fn_exists_conn(conn, "busy")
         assert conn.execute(
-            "select relname from pg_class where relname ~ '^[trcw]_busy_[0-9]{3}$'"
-        ).fetchall() == []
-        assert conn.execute(
-            "select count(*) from pg_class where relname ~ '^t_busy_2031[0-9]{2}$'"
-        ).fetchone()[0] > 0
+            "select default_partition from absurd.queues where queue_name = 'busy'"
+        ).fetchone() == ("disabled",)
+
+
+def test_migration_refuses_a_colliding_queue_created_concurrently(new_database, admin):
+    # A queue created while the rename statement starts can own a new
+    # partition name ("busy_<IYYYIW>" beside partitioned "busy").  The rename
+    # must wait for it and fail instead of renaming a partition onto the name
+    # the new queue then silently shares; the next run reports the collision.
+    dsn = new_database("cf_mig_racecollide")
+    year, week, _ = datetime.now(timezone.utc).isocalendar()
+    tag = f"{year}{week:02d}"
+    migration = migration_sql()
+    split = migration.index("-- Make weekly partition tags year-unique")
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(ABSURD_0_5_0.read_text())
+        conn.execute("select absurd.create_queue('busy', 'partitioned')")
+        conn.execute(migration[:split])
+        before = _old_style_partitions(conn, "busy")
+        assert before
+
+        with psycopg.connect(dsn) as creator, psycopg.connect(dsn) as migrator:
+            creator.execute("select absurd.create_queue(%s)", (f"busy_{tag}",))
+            thread, migrated = _start(migrator, migration[split:], None)
+            _finished_or_waiting(admin, thread, migrator.info.backend_pid)
+            creator.commit()
+            thread.join(30)
+            assert not thread.is_alive()
+            assert isinstance(migrated.get("error"), psycopg.errors.DuplicateTable), (
+                migrated
+            )
+
+        assert conn.execute("select absurd.get_schema_version()").fetchone() == (
+            "0.5.0",
+        )
+        assert _old_style_partitions(conn, "busy") == before
+        with pytest.raises(psycopg.errors.DuplicateTable) as exc:
+            conn.execute(migration)
+        assert f"t_busy_{tag[3:]} -> t_busy_{tag}" in str(exc.value)
+
+
+def test_migration_refuses_a_long_queue_name_created_concurrently(new_database, admin):
+    # Applied as one transaction, 0.5.0's create_queue() can add a 57-byte
+    # partitioned queue after the length preflight ran.  Its year-unique
+    # partition names would be truncated; the rename statement refuses.
+    dsn = new_database("cf_mig_racelong")
+    migration = migration_sql()
+    split = migration.index("-- Make weekly partition tags year-unique")
+    long_queue = "q" * 57
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(ABSURD_0_5_0.read_text())
+        conn.execute("select absurd.create_queue('busy', 'partitioned')")
+
+    with psycopg.connect(dsn) as creator, psycopg.connect(dsn) as migrator:
+        migrator.execute(migration[:split])
+        creator.execute("select absurd.create_queue(%s, 'partitioned')", (long_queue,))
+        thread, migrated = _start(migrator, migration[split:], None)
+        _finished_or_waiting(admin, thread, migrator.info.backend_pid)
+        creator.commit()
+        thread.join(30)
+        assert not thread.is_alive()
+        assert isinstance(migrated.get("error"), psycopg.errors.CheckViolation), (
+            migrated
+        )
+
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        assert conn.execute("select absurd.get_schema_version()").fetchone() == (
+            "0.5.0",
+        )
+        assert _old_style_partitions(conn, long_queue)
 
 
 def claim_fn_exists_conn(conn, queue):
