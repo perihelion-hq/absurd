@@ -192,9 +192,9 @@ $$;
 --
 -- The function is SECURITY INVOKER like every other Absurd function and takes
 -- the same arguments as claim_task() except the queue name, which is baked in
--- so it cannot be pointed at another queue.  Names that would not fit into a
--- 63-byte identifier (possible only for queues created under older, longer
--- naming limits) get no function and keep using claim_task()'s dynamic path.
+-- so it cannot be pointed at another queue.  The queue name must pass
+-- validate_queue_name(), which keeps 'ct_' || queue within PostgreSQL's 63-byte
+-- identifier limit, so the name is never truncated.
 --
 -- The function is owned by the owner of the queue's tables, whichever role
 -- runs this (a migration role, a superuser, or the queue owner itself), so the
@@ -216,9 +216,7 @@ declare
   v_fn_owner oid;
   v_body text;
 begin
-  if octet_length(v_fn_name) > 63 then
-    return;
-  end if;
+  perform absurd.validate_queue_name(p_queue_name);
 
   -- The function must belong to whoever owns the queue's tables, so that role
   -- (and not the role that happened to run this) can later replace or drop it.
@@ -685,14 +683,11 @@ begin
     perform absurd.disable_cron(p_queue_name);
   end if;
 
-  -- Per-queue claim function (see ensure_claim_function).  Skipped when the
-  -- name would be truncated so we never drop another queue's function.
-  if octet_length('ct_' || p_queue_name) <= 63 then
-    execute format(
-      'drop function if exists absurd.%I(text, integer, integer)',
-      'ct_' || p_queue_name
-    );
-  end if;
+  -- Per-queue claim function (see ensure_claim_function).
+  execute format(
+    'drop function if exists absurd.%I(text, integer, integer)',
+    'ct_' || p_queue_name
+  );
 
   execute format('drop table if exists absurd.%I cascade', 'i_' || p_queue_name);
   execute format('drop table if exists absurd.%I cascade', 'w_' || p_queue_name);
@@ -1196,19 +1191,35 @@ declare
 begin
   -- Prefer the per-queue function created by ensure_claim_function(): its
   -- statements are static SQL, so their plans are cached.  Queues without one
-  -- (created before it existed and not yet migrated, or with an over-long
-  -- legacy name) use the dynamic statements below, and so does a caller that
-  -- lacks EXECUTE on it: this function is SECURITY INVOKER, so the generated
-  -- function does not inherit the caller's EXECUTE on claim_task().
+  -- (created before it existed and not yet migrated) use the dynamic
+  -- statements below, and so does a caller that lacks EXECUTE on it: this
+  -- function is SECURITY INVOKER, so the generated function does not inherit
+  -- the caller's EXECUTE on claim_task().
+  --
+  -- Trust boundary.  The function runs with the CALLER's privileges, so
+  -- whoever owns it can run arbitrary code as every role that claims from this
+  -- queue.  The check below establishes that the function is callable
+  -- (has_function_privilege) and that it is owned by the owner of the queue's
+  -- tables, not that it is authentic.  The ownership test stops a role that
+  -- merely holds CREATE on schema absurd from planting ct_<queue> for a queue
+  -- that has none.  It does not stop the owner of the queue's tables, a
+  -- superuser, or a member of the owning role from replacing the function, and
+  -- it does not protect against anything those roles can already do to the
+  -- tables themselves (for example, a trigger).  Schema creators and queue
+  -- owners must be trusted by the roles that claim from those queues.
   --
   -- Everything the dynamic statements need is initialized below this check so
   -- the fast path does no other work.
   if exists (
     select 1
       from pg_catalog.pg_proc p
+      join pg_catalog.pg_class c
+        on c.relnamespace = p.pronamespace
+       and c.relname = 't_' || p_queue_name
      where p.proname = v_fn_name
        and p.pronamespace = 'absurd'::regnamespace
        and p.proargtypes = '25 23 23'::oidvector
+       and p.proowner = c.relowner
        and pg_catalog.has_function_privilege(p.oid, 'execute')
   ) then
     return query execute format('select * from absurd.%I($1, $2, $3)', v_fn_name)

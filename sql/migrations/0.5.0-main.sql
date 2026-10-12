@@ -12,10 +12,43 @@
 --   wake-up over a later event.
 -- * Serializes cleanup_tasks() and cleanup_events() with concurrent work
 --   (row locks, skip locked) and rejects a cleanup limit below 1.
--- * Lowers the queue-name limit to 53 bytes (validate_queue_name) and makes
---   weekly partition tags year-unique (partition_week_tag).
+-- * Lowers the queue-name limit from 57 to 53 bytes (validate_queue_name) and
+--   makes weekly partition tags year-unique (partition_week_tag).
 --
--- Only function definitions change.  No tables or data are touched.
+-- RESTRICTION: every existing queue name must be at most 53 bytes.  0.5.0
+-- accepted 54 to 57 bytes, but a year-unique weekly partition name
+-- ('t_' || queue || '_' || IYYYIW) of such a queue would exceed PostgreSQL's
+-- 63-byte identifier limit and be truncated, and main rejects such names in
+-- create_queue(), get_task_result() and the other functions that validate the
+-- queue name.  The first statement below therefore aborts the whole migration,
+-- before anything is changed, and lists the affected queues.  To remediate, on
+-- the 0.5.0 database drain each listed queue, drop it with absurd.drop_queue()
+-- and recreate it under a name of at most 53 bytes, then apply this migration.
+--
+-- No row data is rewritten.  Function definitions are replaced, claim
+-- functions are created, and the existing weekly partitions of partitioned
+-- queues (and the indexes named after them) are renamed to the new tags.
+-- Everything runs in the transaction of the script, so a failure leaves the
+-- 0.5.0 schema untouched.  Safe to re-run.
+
+do $$
+declare
+  v_queues text;
+begin
+  select string_agg(
+           format('"%s" (%s bytes, %s)', queue_name, octet_length(queue_name), storage_mode),
+           ', ' order by queue_name)
+    into v_queues
+    from absurd.queues
+   where octet_length(queue_name) > 53;
+
+  if v_queues is not null then
+    raise exception 'Cannot migrate to main: queue names are limited to 53 bytes, but these queues are longer: %', v_queues
+      using hint = 'Drain each listed queue, drop it with absurd.drop_queue() and recreate it under a name of at most 53 bytes, then apply this migration again.  Nothing has been changed.',
+            errcode = 'check_violation';
+  end if;
+end;
+$$;
 
 create or replace function absurd.get_schema_version ()
   returns text
@@ -56,9 +89,9 @@ $$;
 --
 -- The function is SECURITY INVOKER like every other Absurd function and takes
 -- the same arguments as claim_task() except the queue name, which is baked in
--- so it cannot be pointed at another queue.  Names that would not fit into a
--- 63-byte identifier (possible only for queues created under older, longer
--- naming limits) get no function and keep using claim_task()'s dynamic path.
+-- so it cannot be pointed at another queue.  The queue name must pass
+-- validate_queue_name(), which keeps 'ct_' || queue within PostgreSQL's 63-byte
+-- identifier limit, so the name is never truncated.
 --
 -- The function is owned by the owner of the queue's tables, whichever role
 -- runs this (a migration role, a superuser, or the queue owner itself), so the
@@ -80,9 +113,7 @@ declare
   v_fn_owner oid;
   v_body text;
 begin
-  if octet_length(v_fn_name) > 63 then
-    return;
-  end if;
+  perform absurd.validate_queue_name(p_queue_name);
 
   -- The function must belong to whoever owns the queue's tables, so that role
   -- (and not the role that happened to run this) can later replace or drop it.
@@ -498,14 +529,11 @@ begin
     perform absurd.disable_cron(p_queue_name);
   end if;
 
-  -- Per-queue claim function (see ensure_claim_function).  Skipped when the
-  -- name would be truncated so we never drop another queue's function.
-  if octet_length('ct_' || p_queue_name) <= 63 then
-    execute format(
-      'drop function if exists absurd.%I(text, integer, integer)',
-      'ct_' || p_queue_name
-    );
-  end if;
+  -- Per-queue claim function (see ensure_claim_function).
+  execute format(
+    'drop function if exists absurd.%I(text, integer, integer)',
+    'ct_' || p_queue_name
+  );
 
   execute format('drop table if exists absurd.%I cascade', 'i_' || p_queue_name);
   execute format('drop table if exists absurd.%I cascade', 'w_' || p_queue_name);
@@ -558,19 +586,35 @@ declare
 begin
   -- Prefer the per-queue function created by ensure_claim_function(): its
   -- statements are static SQL, so their plans are cached.  Queues without one
-  -- (created before it existed and not yet migrated, or with an over-long
-  -- legacy name) use the dynamic statements below, and so does a caller that
-  -- lacks EXECUTE on it: this function is SECURITY INVOKER, so the generated
-  -- function does not inherit the caller's EXECUTE on claim_task().
+  -- (created before it existed and not yet migrated) use the dynamic
+  -- statements below, and so does a caller that lacks EXECUTE on it: this
+  -- function is SECURITY INVOKER, so the generated function does not inherit
+  -- the caller's EXECUTE on claim_task().
+  --
+  -- Trust boundary.  The function runs with the CALLER's privileges, so
+  -- whoever owns it can run arbitrary code as every role that claims from this
+  -- queue.  The check below establishes that the function is callable
+  -- (has_function_privilege) and that it is owned by the owner of the queue's
+  -- tables, not that it is authentic.  The ownership test stops a role that
+  -- merely holds CREATE on schema absurd from planting ct_<queue> for a queue
+  -- that has none.  It does not stop the owner of the queue's tables, a
+  -- superuser, or a member of the owning role from replacing the function, and
+  -- it does not protect against anything those roles can already do to the
+  -- tables themselves (for example, a trigger).  Schema creators and queue
+  -- owners must be trusted by the roles that claim from those queues.
   --
   -- Everything the dynamic statements need is initialized below this check so
   -- the fast path does no other work.
   if exists (
     select 1
       from pg_catalog.pg_proc p
+      join pg_catalog.pg_class c
+        on c.relnamespace = p.pronamespace
+       and c.relname = 't_' || p_queue_name
      where p.proname = v_fn_name
        and p.pronamespace = 'absurd'::regnamespace
        and p.proargtypes = '25 23 23'::oidvector
+       and p.proowner = c.relowner
        and pg_catalog.has_function_privilege(p.oid, 'execute')
   ) then
     return query execute format('select * from absurd.%I($1, $2, $3)', v_fn_name)
@@ -1293,13 +1337,18 @@ begin
 
     execute format('alter table absurd.%I rename to %I', v_partition.child_name, v_new_name);
 
-    -- Keep the generated index and constraint names in step with the table.
+    -- Keep the generated index and constraint names in step with the table
+    -- where the longer name still fits into an identifier.  PostgreSQL named
+    -- the others itself (shortening them to fit), and they stay as they are:
+    -- renaming them here would silently truncate them.
     for v_index in
       select ic.relname
         from pg_catalog.pg_index ix
         join pg_catalog.pg_class ic on ic.oid = ix.indexrelid
        where ix.indrelid = v_partition.child_oid
          and left(ic.relname, length(v_partition.child_name) + 1) = v_partition.child_name || '_'
+         and octet_length(v_new_name)
+             + octet_length(ic.relname) - octet_length(v_partition.child_name) <= 63
     loop
       execute format(
         'alter index absurd.%I rename to %I',

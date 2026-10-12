@@ -141,6 +141,19 @@ as the rest of your database migrations.  For example, to test it directly with
 psql "$PGDATABASE" -f db/migrations/202604010002_absurd_upgrade.sql
 ```
 
+### Upgrading from 0.5.0: queue names are limited to 53 bytes
+
+Queue names of 54 to 57 bytes were accepted by 0.5.0 but are not supported any
+longer: weekly partition names carry a year-unique tag that makes them three
+bytes longer, and PostgreSQL would truncate them to 63 bytes so that different
+weeks collide.  The `0.5.0-main` migration therefore checks first, before it
+changes anything, and fails with an error listing the affected queues if any
+exists.  To upgrade, drain each listed queue on the 0.5.0 database, drop it
+with `absurd.drop_queue()`, recreate it under a name of at most 53 bytes (and
+point your producers and workers at the new name), and run the migration again.
+The check covers unpartitioned queues too, because the functions that validate
+the queue name reject them.
+
 ## Notes
 
 - `absurdctl init` is for **fresh installs**.
