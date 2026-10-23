@@ -1350,6 +1350,12 @@ $$;
 -- task that is then skipped or left over are released again (see step 2 and 3
 -- below).
 --
+-- The walk ends at the first task_id spawn_task could generate after the
+-- cutoff's millisecond: a task created later cannot have reached a terminal
+-- state before the cutoff, so the tasks behind that bound are never
+-- eligible, and a call reads only the tasks older than the TTL instead of the
+-- queue's whole retained history.
+--
 -- Returns the number of tasks deleted.
 create or replace function absurd.cleanup_tasks (
   p_queue_name text,
@@ -1369,6 +1375,7 @@ declare
   v_locked_run_ids uuid[];
   v_accepted_ids uuid[];
   v_after_task_id uuid;
+  v_before_task_id uuid;
   v_max_page_size constant integer := 1000;
   v_page_size integer;
 begin
@@ -1381,6 +1388,10 @@ begin
   end if;
 
   v_cutoff := v_now - (p_ttl_seconds * interval '1 second');
+  -- No UUIDv7 precedes the Unix epoch, so an earlier cutoff admits no task.
+  v_before_task_id := absurd.uuidv7_floor(
+    greatest(v_cutoff, 'epoch'::timestamptz) + interval '1 millisecond'
+  );
 
   select storage_mode into v_storage_mode
   from absurd.queues
@@ -1403,7 +1414,8 @@ begin
     --    run for completed and failed tasks) is older than the cutoff.
     --    task_id is the primary key, so each page continues the index walk
     --    where the previous one stopped instead of joining, filtering and
-    --    sorting the queue's history again.
+    --    sorting the queue's history again, and the walk stops at the cutoff's
+    --    UUIDv7 floor.
     execute format(
       'select coalesce(array_agg(e.task_id order by e.task_id), ''{}''),
               (array_agg(e.task_id order by e.task_id desc))[1]
@@ -1419,6 +1431,7 @@ begin
                     else null
                   end < $1
               and ($3::uuid is null or t.task_id > $3::uuid)
+              and t.task_id < $4
             order by t.task_id
             limit $2
          ) e',
@@ -1426,7 +1439,7 @@ begin
       'r_' || p_queue_name
     )
     into v_task_ids, v_after_task_id
-    using v_cutoff, v_page_size, v_after_task_id;
+    using v_cutoff, v_page_size, v_after_task_id, v_before_task_id;
 
     exit when cardinality(v_task_ids) = 0;
 

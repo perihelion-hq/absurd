@@ -560,8 +560,13 @@ def test_cleanup_tasks_takes_eligible_tasks_in_task_id_order(db_dsn, storage_mod
     with psycopg.connect(db_dsn, autocommit=True) as conn:
         conn.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
         try:
-            # Spawns within one millisecond need not get increasing UUIDv7s, so
-            # the roles follow task_id order, not spawn order.
+            # All three were spawned before any of them finished.  Spawns within
+            # one millisecond need not get increasing UUIDv7s, so the roles
+            # follow task_id order, not spawn order.
+            conn.execute(
+                "select set_config('absurd.fake_now', "
+                "(clock_timestamp() - interval '3 hours')::text, false)"
+            )
             first, second, recent = sorted(
                 conn.execute(
                     "select task_id, run_id from absurd.spawn_task(%s, %s, '{}')",
@@ -569,6 +574,7 @@ def test_cleanup_tasks_takes_eligible_tasks_in_task_id_order(db_dsn, storage_mod
                 ).fetchone()
                 for name in ("a", "b", "c")
             )
+            conn.execute("set absurd.fake_now = default")
             for (task_id, run_id), age in (
                 (first, "1 hour"),
                 (second, "2 hours"),
@@ -665,5 +671,78 @@ def test_cleanup_tasks_reads_history_once_behind_a_long_locked_prefix(
                 locker.rollback()
             assert scans == 0, scans
             assert _remaining_tasks(conn, queue) == set(tasks) - {tasks[locked]}
+        finally:
+            conn.execute("select absurd.drop_queue(%s)", (queue,))
+
+
+@pytest.mark.parametrize("storage_mode", ("unpartitioned", "partitioned"))
+def test_cleanup_tasks_reads_only_tasks_spawned_before_the_cutoff(db_dsn, storage_mode):
+    """The walk ends at the cutoff's UUIDv7 floor.
+
+    A task spawned after the cutoff cannot have ended before it.  Without the
+    bound, a call that finds fewer eligible tasks than its limit walks and
+    probes the queue's whole retained history: here 30000 recent tasks and
+    their runs, to delete the 10 that expired.
+    """
+    queue = f"cleanup_cutoff_{storage_mode[0]}"
+    total, expired = 30000, 10
+    with psycopg.connect(db_dsn, autocommit=True) as conn:
+        conn.execute("select absurd.create_queue(%s, %s)", (queue, storage_mode))
+        try:
+            conn.execute(
+                "select set_config('absurd.fake_now', "
+                "(clock_timestamp() - interval '40 days')::text, false)"
+            )
+            old = {
+                row[0]
+                for row in conn.execute(
+                    "select (absurd.spawn_task(%s, 'old' || i, '{}')).task_id "
+                    "from generate_series(1, %s) i",
+                    (queue, expired),
+                )
+            }
+            conn.execute("set absurd.fake_now = default")
+            conn.execute(
+                "select absurd.spawn_task(%s, 't' || i, '{}') from generate_series(1, %s) i",
+                (queue, total),
+            )
+            conn.execute(
+                sql.SQL(
+                    "update absurd.{} r set state = 'completed', "
+                    "completed_at = t.enqueue_at + interval '1 second' "
+                    "from absurd.{} t where t.task_id = r.task_id"
+                ).format(sql.Identifier(f"r_{queue}"), sql.Identifier(f"t_{queue}"))
+            )
+            conn.execute(
+                sql.SQL("update absurd.{} set state = 'completed'").format(
+                    sql.Identifier(f"t_{queue}")
+                )
+            )
+            conn.execute(
+                sql.SQL("analyze absurd.{}, absurd.{}").format(
+                    sql.Identifier(f"t_{queue}"), sql.Identifier(f"r_{queue}")
+                )
+            )
+            rows_read = (
+                "select coalesce(sum(seq_tup_read + coalesce(idx_tup_fetch, 0)), 0) "
+                "from pg_stat_xact_user_tables where schemaname = 'absurd' and "
+                "(relname in (%s, %s) or relname like %s or relname like %s)"
+            )
+            names = (
+                f"t_{queue}",
+                f"r_{queue}",
+                f"t\\_{queue}\\_%",
+                f"r\\_{queue}\\_%",
+            )
+            with psycopg.connect(db_dsn) as cleaner:
+                before = cleaner.execute(rows_read, names).fetchone()[0]
+                assert cleaner.execute(
+                    "select absurd.cleanup_tasks(%s, %s, 1000)", (queue, 35 * 86400)
+                ).fetchone() == (expired,)
+                reads = cleaner.execute(rows_read, names).fetchone()[0] - before
+                cleaner.commit()
+            assert reads < 1000, reads
+            remaining = _remaining_tasks(conn, queue)
+            assert len(remaining) == total and not remaining & old
         finally:
             conn.execute("select absurd.drop_queue(%s)", (queue,))
