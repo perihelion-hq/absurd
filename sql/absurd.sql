@@ -287,6 +287,7 @@ begin
     select t.task_id
       from absurd.%2$I t
      where t.state in ('pending', 'sleeping', 'running')
+       and t.cancellation is not null
        and (
          (
            (t.cancellation->>'max_delay')::bigint is not null
@@ -631,6 +632,13 @@ begin
         and claim_expires_at is not null',
     ('r_' || p_queue_name) || '_cei',
     'r_' || p_queue_name
+  );
+
+  execute format(
+    'create index if not exists %I on absurd.%I (task_id)
+      where cancellation is not null',
+    ('t_' || p_queue_name) || '_ci',
+    't_' || p_queue_name
   );
 
   execute format(
@@ -1328,6 +1336,7 @@ begin
       'select task_id
          from absurd.%I
         where state in (''pending'', ''sleeping'', ''running'')
+          and cancellation is not null
           and (
             (
               (cancellation->>''max_delay'')::bigint is not null

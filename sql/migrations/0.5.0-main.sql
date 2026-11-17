@@ -1,7 +1,12 @@
 -- Migration from 0.5.0 to main
 --
--- Brings a 0.5.0 database to the current sql/absurd.sql:
+-- Brings a 0.5.0 database, or a 0.5.1 one, to the current sql/absurd.sql:
 --
+-- * Carries upstream 0.5.1's narrowed claim-time cancellation sweep: the
+--   sweep reads only tasks with a cancellation policy, through the new
+--   t_<queue>_ci index, which is created for every existing queue.  (A 0.5.0
+--   database migrated by absurdctl gets 0.5.0-0.5.1 first; this file repeats
+--   that change so it is also complete when applied to 0.5.0 directly.)
 -- * Adds per-queue claim functions (absurd.ct_<queue>) so claim_task() runs
 --   statically planned, plan-cached SQL instead of re-planning dynamic SQL on
 --   every poll.  claim_task() keeps its signature and result columns and falls
@@ -276,6 +281,7 @@ begin
     select t.task_id
       from absurd.%2$I t
      where t.state in ('pending', 'sleeping', 'running')
+       and t.cancellation is not null
        and (
          (
            (t.cancellation->>'max_delay')::bigint is not null
@@ -623,6 +629,13 @@ begin
   );
 
   execute format(
+    'create index if not exists %I on absurd.%I (task_id)
+      where cancellation is not null',
+    ('t_' || p_queue_name) || '_ci',
+    't_' || p_queue_name
+  );
+
+  execute format(
     'create index if not exists %I on absurd.%I (event_name)',
     ('w_' || p_queue_name) || '_eni',
     'w_' || p_queue_name
@@ -815,6 +828,7 @@ begin
       'select task_id
          from absurd.%I
         where state in (''pending'', ''sleeping'', ''running'')
+          and cancellation is not null
           and (
             (
               (cancellation->>''max_delay'')::bigint is not null
@@ -1713,6 +1727,26 @@ end;
 $$;
 
 
+-- Add 0.5.1's active-cancellation index to queues that already exist.  Safe
+-- to re-run (0.5.0-0.5.1 creates the same index).
+do $$
+declare
+  v_queue record;
+begin
+  for v_queue in
+    select queue_name
+      from absurd.queues
+  loop
+    execute format(
+      'create index if not exists %I on absurd.%I (task_id)
+        where cancellation is not null',
+      ('t_' || v_queue.queue_name) || '_ci',
+      't_' || v_queue.queue_name
+    );
+  end loop;
+end;
+$$;
+
 -- Create the claim function for every existing queue.  Safe to re-run.
 -- Each function is owned by the owner of its queue's tables, not by the role
 -- applying this migration.
@@ -1728,7 +1762,8 @@ $$;
 
 -- Publish the new schema version last: absurdctl migrate applies this file
 -- statement by statement and decides from this version whether it still has
--- to be applied, so a failure above leaves the database reporting 0.5.0 and
+-- to be applied, so a failure above leaves the database reporting its previous
+-- version (0.5.0 or 0.5.1) and
 -- the next migrate applies the whole (re-runnable) file again.
 create or replace function absurd.get_schema_version ()
   returns text
